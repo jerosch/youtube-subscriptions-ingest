@@ -5,10 +5,13 @@ throttled. Built from the spec Jeffrey brought back from Ryan Cunningham
 (AI Automation Society), 2026-08-14 — see decisions/log.md.
 
 Pulls YouTube's own caption track directly via the `youtube_transcript_api`
-package (v1.x, `YouTubeTranscriptApi().fetch(video_id)`) — no audio
-download, no Whisper/transcription involved. A straight caption scrape: if
-a video has captions disabled or is region-blocked, there is no fallback
-to audio transcription — this just reports "unavailable".
+package (v1.x) — no audio download, no Whisper/transcription involved. A
+straight caption scrape: if a video has captions disabled or is region-blocked,
+there is no fallback to audio transcription — this just reports "unavailable".
+Language-agnostic: fetches the video's NATIVE language track — the
+auto-generated (asr) track identifies the spoken language, and a manually
+created track in that language is preferred over generated (2026-09-07 —
+previously English-only, which misreported non-English videos as unavailable).
 
 ## Usage (standalone CLI)
     python3 fetch_transcript.py <video-id-or-URL> [--print]
@@ -83,15 +86,33 @@ try:
         InvalidVideoId,
     )
     from youtube_transcript_api.proxies import WebshareProxyConfig, GenericProxyConfig
+    import requests
+    from requests import Session
 except ImportError:
     print("RESULT: error | kind=MissingDependency | Run: pip install youtube-transcript-api")
     sys.exit(1)
 
+# The library's default Session() issues requests with NO timeout — one dead
+# connection hangs the whole run forever (seen in the wild, 2026-09-07: a
+# run of 277 videos stalled indefinitely at #26). Inject connect/read
+# timeouts so a hung socket surfaces as a retryable error instead.
+# Connect is 6s (not 10s) because the proxy-pool runner burns through many
+# dead free proxies; every second shaved off a dead connect multiplies
+# across hundreds of them (2026-09-13).
+REQUEST_TIMEOUT = (6, 30)  # (connect, read) seconds
+
+
+class _TimeoutSession(Session):
+    def get(self, url, **kwargs):
+        kwargs.setdefault("timeout", REQUEST_TIMEOUT)
+        return super().get(url, **kwargs)
+
 YT_THROTTLE_SECONDS = float(os.environ.get("YT_THROTTLE_SECONDS", "1.5"))
 YT_MAX_RETRIES = int(os.environ.get("YT_MAX_RETRIES", "3"))
 
-# Exceptions worth retrying with backoff — transient IP/rate blocks.
-RETRYABLE = (IpBlocked, RequestBlocked)
+# Exceptions worth retrying with backoff — transient IP/rate blocks and
+# network-level failures (hung/dead connections, DNS hiccups).
+RETRYABLE = (IpBlocked, RequestBlocked, requests.Timeout, requests.ConnectionError)
 # Exceptions meaning "this video genuinely has no transcript to get" — no
 # amount of retrying fixes these, report cleanly as unavailable.
 UNAVAILABLE = (TranscriptsDisabled, NoTranscriptFound, VideoUnavailable, VideoUnplayable, AgeRestricted, InvalidVideoId)
@@ -130,7 +151,9 @@ def cache_path(video_id, cache_dir=None):
     return os.path.join(cache_dir, f"yt_{video_id}.txt")
 
 
-def build_proxy_config():
+def build_proxy_config(proxy_url=None):
+    if proxy_url:
+        return GenericProxyConfig(http_url=proxy_url, https_url=proxy_url)
     user = os.environ.get("YT_WEBSHARE_USER")
     password = os.environ.get("YT_WEBSHARE_PASS")
     if user and password:
@@ -142,11 +165,17 @@ def build_proxy_config():
     return None
 
 
-def fetch_transcript(id_or_url, cache_dir=None, print_output=False):
+def fetch_transcript(id_or_url, cache_dir=None, print_output=False, proxy_url=None,
+                     max_retries=None):
     """Core entry point — importable by other scripts (e.g.
     youtube_subscriptions.py's `transcript` command) instead of shelling
     out. Returns a dict, never raises for expected failure modes (blocked/
-    unavailable) — only for a genuinely unresolvable video ID."""
+    unavailable) — only for a genuinely unresolvable video ID.
+
+    proxy_url: explicit proxy for this call (overrides .env proxy settings)
+               — used by proxy-pool runners. max_retries: override the
+               per-call retry count (pool runners pass 1, they retry by
+               rotating proxies instead)."""
     video_id = resolve_video_id(id_or_url)
     if not video_id:
         return {"status": "error", "kind": "InvalidVideoId", "video_id": id_or_url,
@@ -162,21 +191,41 @@ def fetch_transcript(id_or_url, cache_dir=None, print_output=False):
         return {"status": "cached", "video_id": video_id, "text": text,
                 "word_count": len(text.split()), "path": path}
 
-    proxy_config = build_proxy_config()
-    api = YouTubeTranscriptApi(proxy_config=proxy_config)
+    proxy_config = build_proxy_config(proxy_url)
+    api = YouTubeTranscriptApi(http_client=_TimeoutSession(), proxy_config=proxy_config)
+    retries = YT_MAX_RETRIES if max_retries is None else max_retries
 
     attempt = 0
     while True:
         attempt += 1
         time.sleep(YT_THROTTLE_SECONDS)
         try:
-            # languages=("en", "en") matches the original tool's exact
-            # call — a harmless duplicate in the preference list, kept for
-            # fidelity rather than "fixed" unasked.
-            fetched = api.fetch(video_id, languages=("en", "en"))
+            # Native-language fetch: auto-generated (asr) tracks exist only in
+            # the spoken language, so they identify the video's native
+            # language. Prefer a manually created track in that language
+            # (e.g. native German or native English), fall back to generated,
+            # then to any track at all. (Was hardcoded to English-only —
+            # misreported non-English videos as "unavailable"; fixed 2026-09-07.)
+            transcript_list = api.list(video_id)
+            transcripts = list(transcript_list)
+            if not transcripts:
+                raise NoTranscriptFound(video_id, [None], transcript_list)
+            generated = [t for t in transcripts if t.is_generated]
+            manuals = [t for t in transcripts if not t.is_generated]
+            native_code = generated[0].language_code if generated else None
+            if native_code:
+                candidate = (
+                    [t for t in manuals if t.language_code == native_code]
+                    or [t for t in generated if t.language_code == native_code]
+                    or manuals
+                    or generated
+                )
+            else:
+                candidate = manuals or generated
+            fetched = candidate[0].fetch()
             break
         except RETRYABLE as e:
-            if attempt >= YT_MAX_RETRIES:
+            if attempt >= retries:
                 return {
                     "status": "error", "kind": type(e).__name__, "video_id": video_id,
                     "message": (

@@ -14,6 +14,7 @@ Every video becomes its own note, with a full description, clickable links to an
 ## What you get
 
 - **`fetch`** — pulls verbatim video metadata (title, description, views, publish date) from every channel you're subscribed to, into a local `raw/` folder. No interpretation, just the facts.
+- **`transcript`** — pulls each video's caption track straight from YouTube (in the video's native language) into a sidecar file next to the raw metadata. Cached, throttled, and retrying on rate blocks — safe to re-run. Videos with captions off are marked "unavailable", not silently dropped.
 - **`ingest`** — processes `raw/` into your actual vault: one real note per video, plus auto-created/updated "concept" pages (topics like *Automation*, *CRM*, *Sales*) and "entity" pages (named things like *Claude*, *GoHighLevel*) that every relevant video links back to.
 - **No artificial caps** — a channel that posted 500 videos in your chosen window gets all 500, not an arbitrary top-10.
 - **Safe to re-run anytime** — both phases dedupe by YouTube's own Video ID, so running `fetch`/`ingest` again never creates duplicates.
@@ -71,11 +72,27 @@ python scripts/youtube_subscriptions.py test
 # Pull new videos from your subscriptions (add --days N to backfill further, e.g. --days 90)
 python scripts/youtube_subscriptions.py fetch
 
+# Optional middle step: pull each video's caption track (see below)
+python scripts/youtube_subscriptions.py transcript
+
 # Process what's been pulled into real wiki pages
 python scripts/youtube_subscriptions.py ingest
 ```
 
 That's it for the basics. `fetch` alone doesn't make anything searchable — `ingest` is the step that builds the actual knowledge graph.
+
+### The transcript phase
+
+`transcript` sits between `fetch` and `ingest`. It scrapes each video's caption track directly from YouTube's own captions endpoint via `youtube_transcript_api` — no audio download, no Whisper, no paid API. Per video it:
+
+- Fetches the **native-language** track — the auto-generated (asr) track reveals the spoken language, and a manually created track in that language is preferred over generated (so non-English videos aren't misreported as having no transcript).
+- Writes the text to a `.transcript.txt` sidecar next to the raw metadata file and appends a Transcript section into the raw file itself, so `ingest` folds it into the wiki note.
+- **Caches** results to disk (system temp dir by default; override with `YT_TRANSCRIPT_CACHE_DIR`), **throttles** between requests (`YT_THROTTLE_SECONDS`, default 1.5s), and **retries** transient IP/rate blocks with backoff (`YT_MAX_RETRIES`, default 3).
+- Records every outcome in `raw/_transcript-index.tsv`. A video with captions disabled lands there as `unavailable` — a clean end-state, not an error. Re-runs never re-fetch cached videos and pick up anything that previously failed.
+
+All HTTP requests go through a session with connect/read timeouts (6s/30s) — a dead or hung connection surfaces as a retryable error instead of stalling the run indefinitely.
+
+**Proxying** (optional, for when YouTube rate-limits your IP): set `YT_WEBSHARE_USER` + `YT_WEBSHARE_PASS` in `.env` for a Webshare residential proxy, or `YT_PROXY_HTTP`/`YT_PROXY_HTTPS` for a standard proxy URL. For programmatic use, `fetch_transcript()` also accepts per-call `proxy_url=...` and `max_retries=...` overrides — the hook rotating multi-proxy runners build on.
 
 ## Using this with an AI coding assistant (Claude Code, etc.)
 
