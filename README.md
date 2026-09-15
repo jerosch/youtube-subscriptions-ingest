@@ -14,7 +14,7 @@ Every video becomes its own note, with a full description, clickable links to an
 ## What you get
 
 - **`fetch`** — pulls verbatim video metadata (title, description, views, publish date) from every channel you're subscribed to, into a local `raw/` folder. No interpretation, just the facts.
-- **`transcript`** — pulls each video's caption track straight from YouTube (in the video's native language) into a sidecar file next to the raw metadata. Cached, throttled, and retrying on rate blocks — safe to re-run. Videos with captions off are marked "unavailable", not silently dropped.
+- **`transcript`** — pulls each video's caption track straight from YouTube (in the video's native language, or a configured fallback language — see "The transcript phase") into a sidecar file next to the raw metadata. Cached, throttled, and retrying on rate blocks — safe to re-run. Videos with captions off are marked "unavailable", not silently dropped.
 - **`ingest`** — processes `raw/` into your actual vault: one real note per video, plus auto-created/updated "concept" pages (topics like *Automation*, *CRM*, *Sales*) and "entity" pages (named things like *Claude*, *GoHighLevel*) that every relevant video links back to.
 - **No artificial caps** — a channel that posted 500 videos in your chosen window gets all 500, not an arbitrary top-10.
 - **Safe to re-run anytime** — both phases dedupe by YouTube's own Video ID, so running `fetch`/`ingest` again never creates duplicates.
@@ -85,10 +85,12 @@ That's it for the basics. `fetch` alone doesn't make anything searchable — `in
 
 `transcript` sits between `fetch` and `ingest`. It scrapes each video's caption track directly from YouTube's own captions endpoint via `youtube_transcript_api` — no audio download, no Whisper, no paid API. Per video it:
 
-- Fetches the **native-language** track — the auto-generated (asr) track reveals the spoken language, and a manually created track in that language is preferred over generated (so non-English videos aren't misreported as having no transcript).
+- Fetches the video's **native-language** track. The original track is identified by `isTranslatable=true` (translated tracks — including the auto-generated machine translations YouTube serves in dozens of languages on popular videos — are never themselves translatable), with a manually created original preferred over a generated one.
 - Writes the text to a `.transcript.txt` sidecar next to the raw metadata file and appends a Transcript section into the raw file itself, so `ingest` folds it into the wiki note.
 - **Caches** results to disk (system temp dir by default; override with `YT_TRANSCRIPT_CACHE_DIR`), **throttles** between requests (`YT_THROTTLE_SECONDS`, default 1.5s), and **retries** transient IP/rate blocks with backoff (`YT_MAX_RETRIES`, default 3).
 - Records every outcome in `raw/_transcript-index.tsv`. A video with captions disabled lands there as `unavailable` — a clean end-state, not an error. Re-runs never re-fetch cached videos and pick up anything that previously failed.
+
+**Language policy** (optional): by default every video is fetched in its native language. To restrict which languages are ever loaded, set `YT_TRANSCRIPT_LANGUAGES` in `.env` to a comma-separated list of YouTube language codes (e.g. `de,en`). If the video's native language is in the list it is used; otherwise the `YT_TRANSCRIPT_LANGUAGE_PREFERRED` language (e.g. `en`) is fetched as a translation; otherwise the first available allowed track. A video whose captions exist in none of the allowed languages is recorded as `unavailable` (`NoAllowedLanguage`). Leave both unset for the native-language default.
 
 All HTTP requests go through a session with connect/read timeouts (6s/30s) — a dead or hung connection surfaces as a retryable error instead of stalling the run indefinitely.
 

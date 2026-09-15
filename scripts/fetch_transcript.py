@@ -39,10 +39,19 @@ stuffing 10K+ tokens into one tool call.
                              skill — see SKILL.md's port note).
     YT_WEBSHARE_USER        Webshare residential proxy credentials — if set
     YT_WEBSHARE_PASS        (with YT_WEBSHARE_PASS), routes requests through
-                             Webshare to dodge IP blocks. Off by default.
+                              Webshare to dodge IP blocks. Off by default.
     YT_PROXY_HTTP           Generic HTTP/HTTPS proxy URLs, alternative to
     YT_PROXY_HTTPS          Webshare — only used if the Webshare pair above
-                             isn't set.
+                              isn't set.
+    YT_TRANSCRIPT_LANGUAGES Comma-separated allowed languages (YouTube
+                              language codes, e.g. "de,en"). If the video's
+                              native language is in the list it is fetched;
+                              otherwise the preferred language is used.
+                              Unset = no restriction (always native).
+    YT_TRANSCRIPT_LANGUAGE_PREFERRED
+                              Fallback language when the native one isn't in
+                              YT_TRANSCRIPT_LANGUAGES. Should itself be in
+                              the allowed list.
 
 Deliberately does NOT do chapter-based slicing for long videos or bulk
 concurrent fetch (ThreadPoolExecutor) — that's Phase 2, once this core path
@@ -109,6 +118,57 @@ class _TimeoutSession(Session):
 
 YT_THROTTLE_SECONDS = float(os.environ.get("YT_THROTTLE_SECONDS", "1.5"))
 YT_MAX_RETRIES = int(os.environ.get("YT_MAX_RETRIES", "3"))
+
+
+def _parse_lang_list(raw):
+    return {l.strip().lower() for l in raw.split(",") if l.strip()}
+
+
+def transcript_language_policy():
+    """(allowed_set, preferred_code) from env. Empty allowed = unrestricted."""
+    allowed = _parse_lang_list(os.environ.get("YT_TRANSCRIPT_LANGUAGES", ""))
+    preferred = os.environ.get("YT_TRANSCRIPT_LANGUAGE_PREFERRED", "").strip().lower()
+    return allowed, preferred
+
+
+def select_transcript(transcripts):
+    """Pick a caption track per the configured language policy.
+
+    Returns (track, policy) where policy is one of "native", "preferred",
+    "allowed" — or (None, "no_allowed_language") when captions exist but in
+    none of the allowed languages.
+
+    Policy: native language if allowed, else the preferred language, else
+    the first available allowed track (manually created before generated).
+    The native track is identified by isTranslatable=true (the library
+    exposes it as non-empty translation_languages) — translated tracks,
+    including auto-generated translations in dozens of languages on popular
+    videos, are never themselves translatable. "First generated track" is
+    NOT a reliable native marker (arbitrary, region-dependent order — picked
+    an Arabic ASR translation for an English video, 92sCQzn-wG8, 2026-09-15).
+    With YT_TRANSCRIPT_LANGUAGES unset the policy is simply "native".
+    """
+    allowed, preferred = transcript_language_policy()
+    generated = [t for t in transcripts if t.is_generated]
+    manuals = [t for t in transcripts if not t.is_generated]
+    natives = [t for t in transcripts if t.translation_languages]
+    if natives:
+        native = ([t for t in natives if not t.is_generated] or natives)[0]
+    else:
+        # No translatable track (e.g. single-track video): any track is the
+        # only/native one.
+        native = (generated or manuals or transcripts)[0]
+    if not allowed or native.language_code.lower() in allowed:
+        return native, "native"
+    if preferred:
+        cands = [t for t in transcripts if t.language_code.lower() == preferred]
+        if cands:
+            cands.sort(key=lambda t: t.is_generated)
+            return cands[0], "preferred"
+    for t in sorted(transcripts, key=lambda t: t.is_generated):
+        if t.language_code.lower() in allowed:
+            return t, "allowed"
+    return None, "no_allowed_language"
 
 # Exceptions worth retrying with backoff — transient IP/rate blocks and
 # network-level failures (hung/dead connections, DNS hiccups).
@@ -200,29 +260,19 @@ def fetch_transcript(id_or_url, cache_dir=None, print_output=False, proxy_url=No
         attempt += 1
         time.sleep(YT_THROTTLE_SECONDS)
         try:
-            # Native-language fetch: auto-generated (asr) tracks exist only in
-            # the spoken language, so they identify the video's native
-            # language. Prefer a manually created track in that language
-            # (e.g. native German or native English), fall back to generated,
-            # then to any track at all. (Was hardcoded to English-only —
-            # misreported non-English videos as "unavailable"; fixed 2026-09-07.)
+            # Language selection per configured policy (native if allowed,
+            # else preferred, else first allowed; see select_transcript).
             transcript_list = api.list(video_id)
             transcripts = list(transcript_list)
             if not transcripts:
                 raise NoTranscriptFound(video_id, [None], transcript_list)
-            generated = [t for t in transcripts if t.is_generated]
-            manuals = [t for t in transcripts if not t.is_generated]
-            native_code = generated[0].language_code if generated else None
-            if native_code:
-                candidate = (
-                    [t for t in manuals if t.language_code == native_code]
-                    or [t for t in generated if t.language_code == native_code]
-                    or manuals
-                    or generated
-                )
-            else:
-                candidate = manuals or generated
-            fetched = candidate[0].fetch()
+            track, policy = select_transcript(transcripts)
+            if track is None:
+                return {"status": "unavailable", "kind": "NoAllowedLanguage",
+                        "video_id": video_id,
+                        "message": ("captions exist but in none of the "
+                                    "configured YT_TRANSCRIPT_LANGUAGES")}
+            fetched = track.fetch()
             break
         except RETRYABLE as e:
             if attempt >= retries:
@@ -251,7 +301,8 @@ def fetch_transcript(id_or_url, cache_dir=None, print_output=False, proxy_url=No
         print(text)
 
     return {"status": "ok", "video_id": video_id, "text": text,
-            "word_count": len(text.split()), "path": path}
+            "word_count": len(text.split()), "path": path,
+            "language": track.language_code, "language_policy": policy}
 
 
 def main():
