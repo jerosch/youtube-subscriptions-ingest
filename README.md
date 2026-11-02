@@ -17,6 +17,7 @@ Every video becomes its own note, with a full description, clickable links to an
 - **`transcript`** — pulls each video's caption track straight from YouTube (in the video's native language, or a configured fallback language — see "The transcript phase") into a sidecar file next to the raw metadata. Cached, throttled, and retrying on rate blocks — safe to re-run. Videos with captions off are marked "unavailable", not silently dropped.
 - **`ingest`** — processes `raw/` into your actual vault: one real note per video, plus auto-created/updated "concept" pages (topics like *Automation*, *CRM*, *Sales*) and "entity" pages (named things like *Claude*, *GoHighLevel*) that every relevant video links back to.
 - **Channel exclusion** — keep chosen channels out of the pipeline entirely: `configure --exclude-channel "Channel Name"` (repeatable). Exclusions apply to `fetch` and `transcript`; anything already ingested stays in your vault untouched.
+- **`summarize`** *(optional)* — generates a short AI summary of each video's transcript and writes it onto the video's source page. Runs through the [`pi` CLI](https://github.com/badlogic/pi-mono), one stateless ephemeral session per video, so summaries can never influence each other. Idempotent and resumable (see "The summarize phase").
 - **No artificial caps** — a channel that posted 500 videos in your chosen window gets all 500, not an arbitrary top-10.
 - **Safe to re-run anytime** — both phases dedupe by YouTube's own Video ID, so running `fetch`/`ingest` again never creates duplicates.
 - **Portable** — not hardcoded to any one project or vault. First run asks where you want the raw files and the wiki output to go.
@@ -27,6 +28,7 @@ Every video becomes its own note, with a full description, clickable links to an
 - A YouTube/Google account (the one whose subscriptions you want to pull)
 - Your own Google Cloud OAuth credentials (free, ~5 minutes to set up — see below)
 - (Optional but recommended) An Obsidian vault, or willingness to let this scaffold a minimal one
+- (Optional) The [`pi` CLI](https://github.com/badlogic/pi-mono) on your PATH — only needed for the `summarize` command
 
 ## Install
 
@@ -78,6 +80,9 @@ python scripts/youtube_subscriptions.py transcript
 
 # Process what's been pulled into real wiki pages
 python scripts/youtube_subscriptions.py ingest
+
+# Optional: AI summary of each video's transcript, written onto its source page (see below)
+python scripts/youtube_subscriptions.py summarize
 ```
 
 That's it for the basics. `fetch` alone doesn't make anything searchable — `ingest` is the step that builds the actual knowledge graph.
@@ -96,6 +101,14 @@ That's it for the basics. `fetch` alone doesn't make anything searchable — `in
 All HTTP requests go through a session with connect/read timeouts (6s/30s) — a dead or hung connection surfaces as a retryable error instead of stalling the run indefinitely.
 
 **Proxying** (optional, for when YouTube rate-limits your IP): set `YT_WEBSHARE_USER` + `YT_WEBSHARE_PASS` in `.env` for a Webshare residential proxy, or `YT_PROXY_HTTP`/`YT_PROXY_HTTPS` for a standard proxy URL. For programmatic use, `fetch_transcript()` also accepts per-call `proxy_url=...` and `max_retries=...` overrides — the hook rotating multi-proxy runners build on.
+
+### The summarize phase (optional)
+
+`summarize` runs after `ingest` and writes a `## Summary` section (a few sentences distilling the transcript) onto each video's source page, right after `## Description`. It deliberately does **not** ship its own LLM API binding: every summary is a single stateless call to the [`pi` coding-agent CLI](https://github.com/badlogic/pi-mono) (`pi -p --no-session --no-tools`, transcript passed via a temp file), so **pi owns provider, model, and auth** — whatever you have configured there is what gets used. One ephemeral process per video means summaries can never influence each other.
+
+- **Idempotent and resumable** — outcomes are recorded in `raw/_summary-index.tsv`; re-runs only process videos not summarized yet. Videos without a transcript are skipped until `transcript` has caught up.
+- **Language** — `YT_SUMMARY_LANGUAGE` (falls back to `YT_TRANSCRIPT_LANGUAGE_PREFERRED`, then German).
+- **Tuning** (all optional, in `.env`): `YT_SUMMARY_PI_BIN`, `YT_SUMMARY_PI_MODEL`, `YT_SUMMARY_MAX_CHARS` (transcript truncation ceiling), `YT_SUMMARY_TIMEOUT_S`, `YT_SUMMARY_RETRIES`, `YT_SUMMARY_THROTTLE_S`.
 
 ### Channel exclusion
 

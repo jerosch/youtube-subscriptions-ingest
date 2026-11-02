@@ -162,6 +162,19 @@ Report back from the JSON: videos ingested, concepts/entities created vs. update
 - Ingest dedup must use a real index (`_ingest-index.tsv`), not a full directory walk + per-file existence check — that made even a `--limit 5` test scan and disk-check all ~11,800 raw files before doing anything. `video_id` comes straight out of the filename (fixed-width date prefix), not from opening/parsing every file just to filter.
 - `parse_raw_file` must split the Transcript section off `rest` before treating it as the description — once the `transcript` phase started appending a `## Transcript` section onto the same raw `.md` file (2026-08-14), a naive "everything after the title line is the description" swallowed the transcript into the description, producing a duplicated/malformed `## Transcript` heading on the resulting wiki page. Caught in testing that same day, before it ever reached the real archive.
 
+### 4b. Summarize (added 2026-11-02)
+
+Run:
+```
+python scripts/youtube_subscriptions.py summarize [--limit N] [--language de]
+```
+
+For each **already-ingested** video that has a transcript but no `## Summary` section yet, generates a short AI summary and writes it onto that video's wiki source page, directly after `## Description` (before `## Transcript`). Generation goes through the **`pi` coding-agent CLI**, invoked headless as `pi -p --no-session --no-tools` — **one fresh ephemeral process per video**, so no conversation state is ever carried between summaries (explicit requirement: summaries must not influence each other). No bespoke LLM API binding: pi owns provider/model/auth.
+
+Config lives in `.env` (see `.env.example`): `YT_SUMMARY_PI_BIN`, `YT_SUMMARY_PI_MODEL`, `YT_SUMMARY_LANGUAGE` (default falls back to `YT_TRANSCRIPT_LANGUAGE_PREFERRED`, else `de`), `YT_SUMMARY_MAX_CHARS`, `YT_SUMMARY_TIMEOUT_S`, `YT_SUMMARY_RETRIES`, `YT_SUMMARY_THROTTLE_S`.
+
+Dedup via `raw/youtube-videos/_summary-index.tsv` (video_id → ok/no_captions). A video with no transcript yet is skipped **without** indexing (retried next run — same non-terminal semantics as the transcript phase); `no_captions` is terminal. Writing is idempotent: a re-run replaces the existing `## Summary` section rather than duplicating it. Use `--limit N` to test before a full backfill. This is the slowest phase at archive scale (one pi process each) — confirm scope before a full run.
+
 **Unified link mechanism (2026-11-02):** every link the script writes into vault *bodies* goes through the single helper `obsidian_md_link(display, abs_path, base_dir)` — concept/entity "Linked Video Sources" bullets, source-page Concepts/Entities bullets, index.md entries, and log.md entries all use it. It emits a percent-encoded Markdown link where ONLY spaces (and unbalanced parens) are encoded, which is exactly what Obsidian's resolver handles. Wikilinks `[[...]]` are NOT used in bodies: source page names end in ` [Video ID]` (nested-bracket truncation) and concept/entity files are `<slug>.md` (`[[Name]]` never resolves for names with spaces). The one exception is frontmatter `sources: ["[[...]]"]`, which Obsidian's frontmatter reader handles correctly and stays as-is. If a new output surface ever needs links, call `obsidian_md_link` — do not hand-roll `[[...]]`.
 
 **Page-naming rule (added 2026-11-02, migration of 1,537 pages same day):** wiki source page filenames must never contain `#` or `^` — Obsidian treats them as heading/block-ref markers in `[[links]]` and as fragment separators in Markdown links, and there is no reliable escape (`%23` is NOT decoded by Obsidian; a raw `#` becomes a heading anchor → clicking offers "create new page"). `sanitize_page_name()` strips them for all wiki pages; raw/ files are never linked from the vault so they keep the verbatim title. If a future Obsidian link mysteriously creates a duplicate page, check the target filename for `#`/`^` first.
