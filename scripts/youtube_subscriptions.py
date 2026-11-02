@@ -149,6 +149,7 @@ CONCEPTS_DIR = None
 ENTITIES_DIR = None
 INDEX_PATH = None
 LOG_PATH = None
+FEED_PATH = None
 # Channel titles excluded from the pipeline (config key `excluded_channels`).
 # Lower-cased at apply time; matched case-insensitively against both the
 # YouTube subscription channel_title (fetch) and the raw/ top-level channel
@@ -173,7 +174,7 @@ def apply_config():
     Call this at the top of any command that reads/writes raw/ or wiki/
     (not needed for auth/test/configure)."""
     global RAW_DIR, RAW_INDEX_PATH, TRANSCRIPT_INDEX_PATH, INGEST_INDEX_PATH, SUMMARY_INDEX_PATH
-    global SOURCES_DIR, CONCEPTS_DIR, ENTITIES_DIR, INDEX_PATH, LOG_PATH
+    global SOURCES_DIR, CONCEPTS_DIR, ENTITIES_DIR, INDEX_PATH, LOG_PATH, FEED_PATH
     global EXCLUDED_CHANNELS
     cfg = load_config()
     if not cfg:
@@ -194,6 +195,7 @@ def apply_config():
     ENTITIES_DIR = os.path.join(wiki_root, "wiki", "entities")
     INDEX_PATH = os.path.join(wiki_root, "index.md")
     LOG_PATH = os.path.join(wiki_root, "log.md")
+    FEED_PATH = os.path.join(wiki_root, "feed.md")
 
 
 def cmd_configure(args):
@@ -1597,6 +1599,100 @@ def cmd_summarize(args):
     }))
 
 
+# ---------------------------------------------------------------------------
+# Feed page (added 2026-11-02): feed.md at the vault root, every ingested
+# video linked chronologically (newest first), grouped by publish date.
+# Fully regenerated from the two indexes each time — never edited
+# incrementally, so it can never drift from the actual archive.
+# ---------------------------------------------------------------------------
+
+def extract_title_hashtags(raw_path):
+    """Hashtags from the video's ORIGINAL title (kept verbatim in the raw
+    file — the wiki page filename has # stripped, see sanitize_page_name).
+    Reads only the file head; the title is the first line after frontmatter."""
+    try:
+        with open(raw_path, encoding="utf-8", errors="replace") as f:
+            head = f.read(2048)
+    except OSError:
+        return ""
+    parts = head.split("---", 2)
+    if len(parts) < 3:
+        return ""
+    title = parts[2].lstrip("\n").split("\n", 1)[0].lstrip("#").strip()
+    return " ".join(re.findall(r"#\w+", title))
+
+
+def regenerate_feed():
+    raw_by_id = {r["video_id"]: r for r in read_raw_index_rows()}
+    entries = []
+    if os.path.exists(INGEST_INDEX_PATH):
+        with open(INGEST_INDEX_PATH, encoding="utf-8") as f:
+            for line in f.readlines()[1:]:
+                parts = line.rstrip("\n").split("\t")
+                if len(parts) < 2 or not parts[0]:
+                    continue
+                info = raw_by_id.get(parts[0])
+                if not info:
+                    continue
+                entries.append((info["published"], info["channel"], parts[0], parts[1]))
+    entries.sort(key=lambda e: (e[0], page_name(e[3])), reverse=True)
+
+    def esc(s):
+        # pipe and newlines break markdown table cells
+        return s.replace("|", "\\|").replace("\n", " ").strip()
+
+    wiki_root = os.path.dirname(FEED_PATH)
+
+    def md_link(src_abs, vid):
+        """Markdown link (not [[wikilink]]): the source page filename ends in
+        ' [Video ID]', and a nested-bracket wikilink [[Title [ID]]] truncates
+        at the first ']]' run in Obsidian's parser. Visible text drops the
+        ' [Video ID]' suffix so the table shows a clean title."""
+        name = page_name(src_abs)
+        suffix = f" [{vid}]"
+        disp = name[: -len(suffix)] if name.endswith(suffix) else name
+        return obsidian_md_link(disp, src_abs, wiki_root)
+
+    MONTH_NAMES = {1: "Januar", 2: "Februar", 3: "März", 4: "April", 5: "Mai", 6: "Juni",
+                   7: "Juli", 8: "August", 9: "September", 10: "Oktober", 11: "November", 12: "Dezember"}
+
+    # Group newest-first: year (h1) > month (h2) > day (h3), one table per day.
+    # Entries are already sorted desc, so a flat walk with change-detection keeps
+    # the nesting correct without a separate grouping pass.
+    lines = [
+        "**Feed** — alle ingesteten Videos, neueste zuerst. Auto-generiert von "
+        f"`ingest`/`feed`, nicht manuell bearbeiten. {len(entries)} Einträge, "
+        f"Stand {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}.",
+        "",
+    ]
+    cur_year = cur_month = cur_day = None
+    for published, channel, vid, src_abs in entries:
+        year, month, day = published[:4], published[5:7], published[8:10]
+        if year != cur_year:
+            cur_year, cur_month, cur_day = year, None, None
+            lines += [f"# {year}", ""]
+        if month != cur_month:
+            cur_month, cur_day = month, None
+            lines += [f"## {MONTH_NAMES.get(int(month), month)} {year}", ""]
+        if day != cur_day:
+            cur_day = day
+            lines += [f"### {year}-{month}-{day}", "", "| Video | Hashtags | Channel |", "| --- | --- | --- |"]
+        raw_info = raw_by_id.get(vid) or {}
+        tags = extract_title_hashtags(raw_info["raw_path"]) if raw_info.get("raw_path") else ""
+        lines.append(f"| {md_link(src_abs, vid)} | {tags or '—'} | {esc(channel)} |")
+    tmp = FEED_PATH + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines) + "\n")
+    os.replace(tmp, FEED_PATH)
+    return len(entries)
+
+
+def cmd_feed(args):
+    apply_config()
+    n = regenerate_feed()
+    print(json.dumps({"success": True, "feed_path": FEED_PATH, "entries": n}))
+
+
 def cmd_ingest(args):
     apply_config()
     os.makedirs(SOURCES_DIR, exist_ok=True)
@@ -1637,6 +1733,13 @@ def cmd_ingest(args):
     append_ingest_index_rows(ingest_rows)
     update_index(list(new_concepts), list(updated_concepts), list(new_entities), list(updated_entities))
     append_log_entry(sources_created, list(new_concepts), list(updated_concepts), list(new_entities), list(updated_entities))
+    # Feed is derived state — a failure here must never fail the ingest itself.
+    feed_ok = True
+    try:
+        regenerate_feed()
+    except Exception as e:
+        feed_ok = False
+        print(f"WARNING: feed.md regeneration failed: {e}", file=sys.stderr)
 
     total_raw = len(read_raw_index_rows())
     total_ingested = len(read_ingested_video_ids())
@@ -1648,6 +1751,7 @@ def cmd_ingest(args):
         "concepts_updated": len(updated_concepts),
         "entities_created": len(new_entities),
         "entities_updated": len(updated_entities),
+        "feed_regenerated": feed_ok,
     }))
 
 
@@ -1695,11 +1799,13 @@ def main():
     p_summarize.add_argument("--language", default=None,
                              help="Summary language (de/en/...); default: YT_SUMMARY_LANGUAGE / YT_TRANSCRIPT_LANGUAGE_PREFERRED")
 
+    sub.add_parser("feed", help="Regenerate feed.md (chronological link list of all ingested videos)")
+
     args = parser.parse_args()
     {
         "configure": cmd_configure, "auth": cmd_auth, "test": cmd_test,
         "fetch": cmd_fetch, "refresh": cmd_refresh, "transcript": cmd_transcript,
-        "ingest": cmd_ingest, "summarize": cmd_summarize,
+        "ingest": cmd_ingest, "summarize": cmd_summarize, "feed": cmd_feed,
     }[args.command](args)
 
 

@@ -16,8 +16,9 @@ Every video becomes its own note, with a full description, clickable links to an
 - **`fetch`** — pulls verbatim video metadata (title, description, views, publish date) from every channel you're subscribed to, into a local `raw/` folder. No interpretation, just the facts.
 - **`transcript`** — pulls each video's caption track straight from YouTube (in the video's native language, or a configured fallback language — see "The transcript phase") into a sidecar file next to the raw metadata. Cached, throttled, and retrying on rate blocks — safe to re-run. Videos with captions off are marked "unavailable", not silently dropped.
 - **`ingest`** — processes `raw/` into your actual vault: one real note per video, plus auto-created/updated "concept" pages (topics like *Automation*, *CRM*, *Sales*) and "entity" pages (named things like *Claude*, *GoHighLevel*) that every relevant video links back to.
-- **Channel exclusion** — keep chosen channels out of the pipeline entirely: `configure --exclude-channel "Channel Name"` (repeatable). Exclusions apply to `fetch` and `transcript`; anything already ingested stays in your vault untouched.
 - **`summarize`** *(optional)* — generates a short AI summary of each video's transcript and writes it onto the video's source page. Runs through the [`pi` CLI](https://github.com/badlogic/pi-mono), one stateless ephemeral session per video, so summaries can never influence each other. Idempotent and resumable (see "The summarize phase").
+- **`feed`** — regenerates a chronological `feed.md` at the vault root: every ingested video, grouped by year → month → day, one table per day (`Video | Hashtags | Channel`). `ingest` refreshes it automatically at the end of every run.
+- **Channel exclusion** — keep chosen channels out of the pipeline entirely: `configure --exclude-channel "Channel Name"` (repeatable). Exclusions apply to `fetch` and `transcript`; anything already ingested stays in your vault untouched.
 - **No artificial caps** — a channel that posted 500 videos in your chosen window gets all 500, not an arbitrary top-10.
 - **Safe to re-run anytime** — both phases dedupe by YouTube's own Video ID, so running `fetch`/`ingest` again never creates duplicates.
 - **Portable** — not hardcoded to any one project or vault. First run asks where you want the raw files and the wiki output to go.
@@ -83,6 +84,9 @@ python scripts/youtube_subscriptions.py ingest
 
 # Optional: AI summary of each video's transcript, written onto its source page (see below)
 python scripts/youtube_subscriptions.py summarize
+
+# Regenerate the chronological feed page (ingest already does this automatically)
+python scripts/youtube_subscriptions.py feed
 ```
 
 That's it for the basics. `fetch` alone doesn't make anything searchable — `ingest` is the step that builds the actual knowledge graph.
@@ -118,9 +122,13 @@ python scripts/youtube_subscriptions.py configure --exclude-channel "Channel A" 
 
 The list is stored in the config file and survives later `configure` runs (re-run without `--exclude-channel` to keep it; pass a new list to replace it). Matching is case-insensitive on the channel title. Excluded channels are skipped by `fetch` and `transcript` — already-ingested pages are never removed.
 
+### The feed page
+
+`feed.md` is fully rebuilt from the fetch + ingest indexes on every `ingest`/`feed` run, so it can never drift from the actual archive. Video cells link the source pages using the link mechanism described below, and show the hashtags found in the original video title (`—` when the title has none).
+
 ### How links work in this vault
 
-All links the tool writes into page *bodies* (concept/entity backlink bullets, `index.md`, `log.md`) use one shared mechanism: a percent-encoded Markdown link where **only spaces are encoded** — exactly what Obsidian's link resolver handles. `[[wikilinks]]` are avoided in bodies on purpose: source page filenames end in ` [Video ID]` (a nested-bracket wikilink truncates at the first `]`), and Obsidian cannot link to filenames containing `#` or `^` at all (they read as heading/block-ref markers, with no working escape) — so those characters are stripped from wiki page filenames. Frontmatter `sources: ["[[...]]"]` is the one exception; Obsidian's frontmatter reader handles it correctly and it stays as wikilinks.
+All links the tool writes into page *bodies* (feed tables, concept/entity backlink bullets, `index.md`, `log.md`) use one shared mechanism: a percent-encoded Markdown link where **only spaces are encoded** — exactly what Obsidian's link resolver handles. `[[wikilinks]]` are avoided in bodies on purpose: source page filenames end in ` [Video ID]` (a nested-bracket wikilink truncates at the first `]`), and Obsidian cannot link to filenames containing `#` or `^` at all (they read as heading/block-ref markers, with no working escape) — so those characters are stripped from wiki page filenames. Frontmatter `sources: ["[[...]]"]` is the one exception; Obsidian's frontmatter reader handles it correctly and it stays as wikilinks.
 
 ## Using this with an AI coding assistant (Claude Code, etc.)
 
