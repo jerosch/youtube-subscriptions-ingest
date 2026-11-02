@@ -146,6 +146,7 @@ RAW_INDEX_PATH = None
 TRANSCRIPT_INDEX_PATH = None
 INGEST_INDEX_PATH = None
 SUMMARY_INDEX_PATH = None
+REFORMAT_INDEX_PATH = None
 THUMBNAIL_INDEX_PATH = None
 SOURCES_DIR = None
 CONCEPTS_DIR = None
@@ -177,7 +178,7 @@ def apply_config():
     """Populates the module-level path globals from the saved config.
     Call this at the top of any command that reads/writes raw/ or wiki/
     (not needed for auth/test/configure)."""
-    global RAW_DIR, RAW_INDEX_PATH, TRANSCRIPT_INDEX_PATH, INGEST_INDEX_PATH, SUMMARY_INDEX_PATH, THUMBNAIL_INDEX_PATH
+    global RAW_DIR, RAW_INDEX_PATH, TRANSCRIPT_INDEX_PATH, INGEST_INDEX_PATH, SUMMARY_INDEX_PATH, REFORMAT_INDEX_PATH, THUMBNAIL_INDEX_PATH
     global SOURCES_DIR, CONCEPTS_DIR, ENTITIES_DIR, INDEX_PATH, LOG_PATH, FEED_PATH, THUMBS_DIR
     global EXCLUDED_CHANNELS
     cfg = load_config()
@@ -194,6 +195,7 @@ def apply_config():
     TRANSCRIPT_INDEX_PATH = os.path.join(raw_dir, "_transcript-index.tsv")
     INGEST_INDEX_PATH = os.path.join(raw_dir, "_ingest-index.tsv")
     SUMMARY_INDEX_PATH = os.path.join(raw_dir, "_summary-index.tsv")
+    REFORMAT_INDEX_PATH = os.path.join(raw_dir, "_reformat-index.tsv")
     THUMBNAIL_INDEX_PATH = os.path.join(raw_dir, "_thumbnail-index.tsv")
     SOURCES_DIR = os.path.join(wiki_root, "wiki", "sources", "youtube-videos")
     CONCEPTS_DIR = os.path.join(wiki_root, "wiki", "concepts")
@@ -1608,6 +1610,198 @@ def cmd_summarize(args):
 
 
 # ---------------------------------------------------------------------------
+# reformat — AI-inserted paragraphs + headings into the transcript (added
+# 2026-11-02). Same index-based resumable shape as summarize, same pi
+# mechanics (stateless one call per video). Raw/ sidecars stay verbatim on
+# purpose; only the ## Transcript section on the wiki source page is
+# reformatted. Complements the timing-based paragraphing in
+# fetch_transcript.py (new fetches get free verbatim paragraphs; this pass
+# brings the existing archive up, and adds headings on top).
+# Env: YT_REFORMAT_PI_BIN / YT_REFORMAT_PI_MODEL (default to the
+# YT_SUMMARY_* values), YT_REFORMAT_MAX_CHARS (default 120000 — longer
+# transcripts are marked too_long instead of silently truncated, because
+# unlike summarizing, reformatting must never drop content),
+# YT_REFORMAT_TIMEOUT_S (300), YT_REFORMAT_RETRIES (2), YT_REFORMAT_THROTTLE_S (0).
+# ---------------------------------------------------------------------------
+
+REFORMAT_INDEX_HEADER = "video_id\tstatus\treformatted\n"
+
+# The ## Transcript section of a source page, up to the next ## heading.
+SOURCE_TRANSCRIPT_RE = re.compile(
+    r"(?ms)^" + re.escape(TRANSCRIPT_HEADING) + r"\s*\n.*?(?=^## |\Z)")
+
+
+def reformat_config():
+    return {
+        "pi_bin": os.environ.get("YT_REFORMAT_PI_BIN",
+                                 os.environ.get("YT_SUMMARY_PI_BIN", "pi")),
+        "model": os.environ.get("YT_REFORMAT_PI_MODEL",
+                                os.environ.get("YT_SUMMARY_PI_MODEL", "")).strip(),
+        "max_chars": int(os.environ.get("YT_REFORMAT_MAX_CHARS", "120000")),
+        "timeout_s": float(os.environ.get("YT_REFORMAT_TIMEOUT_S", "300")),
+        "retries": int(os.environ.get("YT_REFORMAT_RETRIES", "2")),
+        "throttle_s": float(os.environ.get("YT_REFORMAT_THROTTLE_S", "0")),
+    }
+
+
+def read_reformat_index_rows():
+    if not os.path.exists(REFORMAT_INDEX_PATH):
+        return []
+    rows = []
+    with open(REFORMAT_INDEX_PATH, encoding="utf-8") as f:
+        for line in f.readlines()[1:]:
+            parts = line.rstrip("\n").split("\t")
+            if len(parts) >= 3 and parts[0]:
+                rows.append({"video_id": parts[0], "status": parts[1], "reformatted": parts[2]})
+    return rows
+
+
+def reformat_done_ids():
+    return {r["video_id"] for r in read_reformat_index_rows()}
+
+
+def append_reformat_index_rows(rows):
+    is_new = not os.path.exists(REFORMAT_INDEX_PATH)
+    with open(REFORMAT_INDEX_PATH, "a", encoding="utf-8") as f:
+        if is_new:
+            f.write(REFORMAT_INDEX_HEADER)
+        for r in rows:
+            f.write(f"{r['video_id']}\t{r['status']}\t{r['reformatted']}\n")
+
+
+def reformat_one_video(transcript, cfg):
+    """One headless pi call: insert paragraph breaks and short ### headings,
+    never touch the spoken words. The word-count guard rejects outputs where
+    the model summarized, truncated or refused instead of formatting."""
+    system = (
+        "You format a raw YouTube video transcript for reading. Insert blank "
+        "lines to form paragraphs and short markdown '###' headings where the "
+        "topic changes (2-6 words each, in the same language as the transcript). "
+        "Hard rule: never change, add, or remove any word of the spoken text "
+        "itself — only whitespace and headings. No preamble, no commentary, no "
+        "code fences. Output only the formatted transcript."
+    )
+    user = "Format the transcript from the given file."
+    fd, tmp_path = tempfile.mkstemp(prefix="yt_fmt_", suffix=".txt")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(f"Transcript:\n{transcript}\n")
+        cmd = [cfg["pi_bin"], "-p", "--no-session", "--no-tools", "--system-prompt", system]
+        if cfg["model"]:
+            cmd += ["--model", cfg["model"]]
+        cmd += [f"@{tmp_path}", user]
+        last_err = None
+        min_words = int(len(transcript.split()) * 0.8)
+        for attempt in range(cfg["retries"] + 1):
+            try:
+                r = subprocess.run(cmd, capture_output=True, text=True, timeout=cfg["timeout_s"])
+                out = r.stdout.strip()
+                if r.returncode == 0 and out:
+                    if out.startswith("```"):
+                        out = re.sub(r"^```[a-zA-Z]*\n?|```$", "", out).strip()
+                    if len(out.split()) >= min_words:
+                        return out
+                    last_err = (f"output has {len(out.split())} words, expected "
+                                f">= {min_words} — model likely altered content")
+                else:
+                    last_err = f"rc={r.returncode}: {(r.stderr or r.stdout).strip()[:200]}"
+            except subprocess.TimeoutExpired:
+                last_err = f"timeout after {cfg['timeout_s']}s"
+            time.sleep(2 ** (attempt + 1))
+        raise RuntimeError(f"pi reformat failed after {cfg['retries'] + 1} attempts: {last_err}")
+    finally:
+        try:
+            os.remove(tmp_path)
+        except OSError:
+            pass
+
+
+def write_transcript_into_source_page(path, formatted_text):
+    """Replace the ## Transcript section body on a wiki source page
+    (idempotent, lambda replacement like write_summary_into_source_page)."""
+    with open(path, encoding="utf-8") as f:
+        content = f.read()
+    section = f"{TRANSCRIPT_HEADING}\n\n{formatted_text.strip()}\n\n"
+    if SOURCE_TRANSCRIPT_RE.search(content):
+        new_content = SOURCE_TRANSCRIPT_RE.sub(lambda m: section, content, count=1)
+    else:
+        new_content = content.rstrip("\n") + "\n\n" + section
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(new_content)
+
+
+def cmd_reformat(args):
+    apply_config()
+    cfg = reformat_config()
+
+    raw_by_id = {r["video_id"]: r["raw_path"] for r in read_raw_index_rows()}
+    ingested = []
+    if os.path.exists(INGEST_INDEX_PATH):
+        with open(INGEST_INDEX_PATH, encoding="utf-8") as f:
+            for line in f.readlines()[1:]:
+                parts = line.rstrip("\n").split("\t")
+                if len(parts) >= 2 and parts[0]:
+                    ingested.append((parts[0], parts[1]))
+    done = reformat_done_ids()
+
+    reformatted = skipped_nocap = skipped_long = errors = 0
+    index_rows = []
+    processed = 0
+    for vid, src in ingested:
+        if vid in done or not os.path.exists(src):
+            continue
+        raw_path = raw_by_id.get(vid)
+        if not raw_path or not os.path.exists(raw_path):
+            continue
+        fields = parse_raw_file(raw_path)
+        if not fields:
+            continue
+        transcript = fields.get("transcript")
+        if transcript is None:
+            continue  # transcript not fetched yet — not terminal, retried next run
+        now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        if transcript.strip() == TRANSCRIPT_UNAVAILABLE.strip():
+            index_rows.append({"video_id": vid, "status": "no_captions", "reformatted": now})
+            skipped_nocap += 1
+            continue
+        if len(transcript) > cfg["max_chars"]:
+            # terminal: truncating would drop content, and re-fetching with
+            # timing paragraphs (fetch_transcript.py) is the fix for these
+            index_rows.append({"video_id": vid, "status": "too_long", "reformatted": now})
+            skipped_long += 1
+            continue
+        try:
+            text = reformat_one_video(transcript, cfg)
+        except Exception as e:
+            errors += 1
+            print(f"error {vid}: {e}", file=sys.stderr)
+            continue
+        write_transcript_into_source_page(src, text)
+        index_rows.append({"video_id": vid, "status": "ok", "reformatted": now})
+        reformatted += 1
+        processed += 1
+        if len(index_rows) >= 50:
+            append_reformat_index_rows(index_rows)
+            index_rows = []
+        if args.limit and processed >= args.limit:
+            break
+        if cfg["throttle_s"]:
+            time.sleep(cfg["throttle_s"])
+    if index_rows:
+        append_reformat_index_rows(index_rows)
+
+    remaining = max(0, len(ingested) - len(reformat_done_ids()))
+    print(json.dumps({
+        "success": True,
+        "reformatted": reformatted,
+        "skipped_no_captions": skipped_nocap,
+        "skipped_too_long": skipped_long,
+        "errors_this_run": errors,
+        "remaining_unreformatted": remaining,
+    }))
+
+
+# ---------------------------------------------------------------------------
 # Feed page (added 2026-11-02): feed.md at the vault root, every ingested
 # video linked chronologically (newest first), grouped by publish date.
 # Fully regenerated from the two indexes each time — never edited
@@ -1988,6 +2182,10 @@ def main():
     p_summarize.add_argument("--language", default=None,
                              help="Summary language (de/en/...); default: YT_SUMMARY_LANGUAGE / YT_TRANSCRIPT_LANGUAGE_PREFERRED")
 
+    p_reformat = sub.add_parser("reformat", help="Insert paragraphs and ### headings into existing transcripts on the wiki source pages (via the pi CLI, word-preserving, resumable)")
+    p_reformat.add_argument("--limit", type=int, default=None,
+                            help="Only reformat the first N videos lacking a reformat result (for testing before a full run)")
+
     sub.add_parser("feed", help="Regenerate feed.md (chronological link list of all ingested videos)")
 
     p_thumbnails = sub.add_parser("thumbnails", help="Download YouTube thumbnails for ingested videos into the vault, embed them on source pages and in the feed (resumable)")
@@ -1998,7 +2196,8 @@ def main():
     {
         "configure": cmd_configure, "auth": cmd_auth, "test": cmd_test,
         "fetch": cmd_fetch, "refresh": cmd_refresh, "transcript": cmd_transcript,
-        "ingest": cmd_ingest, "summarize": cmd_summarize, "feed": cmd_feed,
+        "ingest": cmd_ingest, "summarize": cmd_summarize, "reformat": cmd_reformat,
+        "feed": cmd_feed,
         "thumbnails": cmd_thumbnails,
     }[args.command](args)
 

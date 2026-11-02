@@ -118,6 +118,12 @@ class _TimeoutSession(Session):
 
 YT_THROTTLE_SECONDS = float(os.environ.get("YT_THROTTLE_SECONDS", "1.5"))
 YT_MAX_RETRIES = int(os.environ.get("YT_MAX_RETRIES", "3"))
+# Pause length (s) between caption snippets that starts a new paragraph.
+# Added 2026-11-02: transcripts used to be one flat text block; the caption
+# snippets carry start/duration timing, so a real speaking pause can be turned
+# into a paragraph break for free, verbatim, no LLM. Auto-generated tracks are
+# near-continuous, so only genuine pauses exceed this.
+YT_PARAGRAPH_GAP_S = float(os.environ.get("YT_PARAGRAPH_GAP_S", "1.0"))
 
 
 def _parse_lang_list(raw):
@@ -225,6 +231,35 @@ def build_proxy_config(proxy_url=None):
     return None
 
 
+def snippets_to_text(snippets, gap_s=None):
+    """Join caption snippets into readable text. Same word sequence as the
+    old flat `" ".join(...)`, but a pause of >= gap_s seconds between the end
+    of one snippet and the start of the next becomes a paragraph break
+    (`\\n\\n`). Snippets without usable timing fall back to plain spaces, so
+    the output can never lose words."""
+    gap = YT_PARAGRAPH_GAP_S if gap_s is None else gap_s
+    parts = []
+    prev_end = None
+    for sn in snippets:
+        text = (sn.text or "").strip()
+        if not text:
+            continue
+        start = getattr(sn, "start", None)
+        duration = getattr(sn, "duration", None)
+        if parts:
+            if (prev_end is not None and start is not None
+                    and start - prev_end >= gap):
+                parts.append("\n\n")
+            else:
+                parts.append(" ")
+        parts.append(text)
+        if start is not None and duration is not None:
+            prev_end = start + duration
+        else:
+            prev_end = None
+    return "".join(parts)
+
+
 def fetch_transcript(id_or_url, cache_dir=None, print_output=False, proxy_url=None,
                      max_retries=None):
     """Core entry point — importable by other scripts (e.g.
@@ -292,7 +327,7 @@ def fetch_transcript(id_or_url, cache_dir=None, print_output=False, proxy_url=No
             return {"status": "error", "kind": type(e).__name__, "video_id": video_id,
                     "message": str(e)}
 
-    text = " ".join(snippet.text.strip() for snippet in fetched.snippets if snippet.text.strip())
+    text = snippets_to_text(fetched.snippets)
     os.makedirs(os.path.dirname(path), exist_ok=True)
     with open(path, "w", encoding="utf-8") as f:
         f.write(text)

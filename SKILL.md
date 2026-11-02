@@ -122,7 +122,7 @@ Run:
 python scripts/youtube_subscriptions.py transcript [--limit N]
 ```
 
-For each raw video without a terminal transcript result yet, calls `scripts/fetch_transcript.py` (importable — same folder), which pulls the caption track via `youtube_transcript_api`, caches it (`yt_<id>.txt` in the configured cache dir, `C:\tmp` by default on Windows), throttles between requests, and retries with backoff on IP/rate blocks.
+For each raw video without a terminal transcript result yet, calls `scripts/fetch_transcript.py` (importable — same folder), which pulls the caption track via `youtube_transcript_api`, caches it (`yt_<id>.txt` in the configured cache dir, `C:\tmp` by default on Windows), throttles between requests, and retries with backoff on IP/rate blocks. Since 2026-11-02 the text is built by `snippets_to_text()`: a pause of ≥ `YT_PARAGRAPH_GAP_S` (default 1.0 s) between one caption snippet's end and the next one's start becomes a paragraph break — verbatim word sequence, timing only, no LLM. Snippets without usable timing fall back to plain spaces.
 
 On success, the transcript text is written to **two places**: appended onto the raw `.md` file itself as a `## Transcript` section directly after the description (the canonical copy — `write_transcript_into_raw_file`, idempotent, replaces rather than duplicates on a re-run), and a plain-text `<date>-<id>.transcript.txt` sidecar next to it (convenience copy only). `refresh` re-writing a raw file's metadata preserves an existing Transcript section rather than wiping it.
 
@@ -196,6 +196,19 @@ python scripts/youtube_subscriptions.py thumbnails [--limit N]
 ```
 
 Downloads `https://i.ytimg.com/vi/<id>/hqdefault.jpg` (480x360 — exists for every video, unlike maxresdefault) for every **already-ingested** video into `<wiki_root>/wiki/sources/youtube-videos/_thumbnails/<video_id>.jpg`, embeds `![Thumbnail|320](../_thumbnails/<id>.jpg)` right after the `**Views:**` line of the source page (idempotent: replaces an existing line), and the feed's Thumbnail column shows `![Thumbnail\|140](…)` (`—` when missing). Dedup via `raw/youtube-videos/_thumbnail-index.tsv` (ok/unavailable terminal; transient errors retried next run). Tuning via `YT_THUMBNAIL_THROTTLE_S` (default 0.2), `YT_THUMBNAIL_TIMEOUT_S`, `YT_THUMBNAIL_RETRIES`. Videos ingested after a run are picked up by the next `thumbnails` run; new pages written by `ingest` embed the image automatically when the file already exists.
+
+### 4e. Reformat (added 2026-11-02)
+
+Run:
+```
+python scripts/youtube_subscriptions.py reformat [--limit N]
+```
+
+For each **already-ingested** video with a transcript, rewrites the `## Transcript` section on its wiki source page with a readable version: paragraph breaks plus short `###` headings where the topic changes. Same pi mechanics as summarize (`pi -p --no-session --no-tools`, one ephemeral process per video), with a hard word-preservation instruction **and an output guard**: the formatted text must retain ≥80 % of the transcript's word count or the video is treated as an error and retried (protects against the model summarizing/truncating instead of formatting). Verified on a German test video: 100 % word-level identity, 21 headings added.
+
+`raw/` sidecars (`*.transcript.txt`) are deliberately **never** touched — they stay the verbatim archive; only the wiki page is reformatted. Dedup via `raw/youtube-videos/_reformat-index.tsv` (`ok`/`no_captions`/`too_long` terminal; errors retried next run). Transcripts over `YT_REFORMAT_MAX_CHARS` (default 120000) get `too_long` instead of being truncated — reformatting must never drop content. Tuning via `YT_REFORMAT_PI_BIN`/`YT_REFORMAT_PI_MODEL` (default to the `YT_SUMMARY_*` values), `YT_REFORMAT_TIMEOUT_S`, `YT_REFORMAT_RETRIES`, `YT_REFORMAT_THROTTLE_S`.
+
+Complement: `fetch_transcript.py` already breaks paragraphs at real speaking pauses (caption snippet timing, gap ≥ `YT_PARAGRAPH_GAP_S`, default 1.0 s) for **new** fetches — verbatim, no LLM. `reformat` is the pass that brings the existing archive up and adds headings; new videos may still get it for the headings.
 
 ### 5. Show Local
 
