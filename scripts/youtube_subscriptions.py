@@ -144,6 +144,16 @@ CONCEPTS_DIR = None
 ENTITIES_DIR = None
 INDEX_PATH = None
 LOG_PATH = None
+# Channel titles excluded from the pipeline (config key `excluded_channels`).
+# Lower-cased at apply time; matched case-insensitively against both the
+# YouTube subscription channel_title (fetch) and the raw/ top-level channel
+# folder name (transcript). Deliberately does NOT affect ingest — already
+# archived videos still land in the wiki.
+EXCLUDED_CHANNELS = []
+
+
+def _excluded_channel_set():
+    return {t.strip().lower() for t in EXCLUDED_CHANNELS if t and t.strip()}
 
 
 def load_config():
@@ -159,6 +169,7 @@ def apply_config():
     (not needed for auth/test/configure)."""
     global RAW_DIR, RAW_INDEX_PATH, TRANSCRIPT_INDEX_PATH, INGEST_INDEX_PATH
     global SOURCES_DIR, CONCEPTS_DIR, ENTITIES_DIR, INDEX_PATH, LOG_PATH
+    global EXCLUDED_CHANNELS
     cfg = load_config()
     if not cfg:
         err(
@@ -167,6 +178,7 @@ def apply_config():
         )
     raw_dir = os.path.abspath(cfg["raw_dir"])
     wiki_root = os.path.abspath(cfg["wiki_root"])
+    EXCLUDED_CHANNELS = list(cfg.get("excluded_channels", []))
     RAW_DIR = raw_dir
     RAW_INDEX_PATH = os.path.join(raw_dir, "_fetch-index.tsv")
     TRANSCRIPT_INDEX_PATH = os.path.join(raw_dir, "_transcript-index.tsv")
@@ -185,6 +197,16 @@ def cmd_configure(args):
     os.makedirs(os.path.join(wiki_root, "wiki", "sources", "youtube-videos"), exist_ok=True)
     os.makedirs(os.path.join(wiki_root, "wiki", "concepts"), exist_ok=True)
     os.makedirs(os.path.join(wiki_root, "wiki", "entities"), exist_ok=True)
+    # excluded_channels: the --exclude-channel flags, when present, REPLACE
+    # the stored list (explicit intent); when absent, the existing list is
+    # preserved so a plain re-run of configure never silently drops
+    # previously configured exclusions.
+    if args.exclude_channel is not None:
+        # Trim, drop empties, de-dupe (keep order).
+        excluded = list(dict.fromkeys(x.strip() for x in args.exclude_channel if x and x.strip()))
+    else:
+        existing = load_config() or {}
+        excluded = list(existing.get("excluded_channels", []))
     index_path = os.path.join(wiki_root, "index.md")
     log_path = os.path.join(wiki_root, "log.md")
     # Only scaffold these if genuinely absent — never overwrite an
@@ -206,14 +228,16 @@ def cmd_configure(args):
             f.write("# Log\n\nAppend-only. Newest entries at the bottom.\n")
 
     with open(CONFIG_PATH, "w", encoding="utf-8") as f:
-        json.dump({"raw_dir": raw_dir, "wiki_root": wiki_root}, f, indent=2)
+        json.dump({"raw_dir": raw_dir, "wiki_root": wiki_root,
+                   "excluded_channels": excluded}, f, indent=2, ensure_ascii=False)
 
     print(json.dumps({
         "success": True,
         "raw_dir": raw_dir,
         "wiki_root": wiki_root,
+        "excluded_channels": excluded,
         "config_path": CONFIG_PATH,
-    }))
+    }, ensure_ascii=False))
 
 # Shared between raw/ files (transcript command appends this section) and
 # wiki/ source pages (ingest writes it) so both stay in the same format —
@@ -678,6 +702,25 @@ def cmd_fetch(args):
         }))
         return
 
+    # Channel exclusion (config `excluded_channels`): filter BEFORE
+    # playlist resolution — an excluded channel costs zero API quota.
+    # Matching is case-insensitive on the subscription channel_title; the
+    # raw/ folder names written later come from the same title, so the
+    # same list also covers the transcript phase (folder-name match).
+    excluded_set = _excluded_channel_set()
+    if excluded_set:
+        excluded_subs = [s for s in subs if s["channel_title"].strip().lower() in excluded_set]
+        subs = [s for s in subs if s["channel_title"].strip().lower() not in excluded_set]
+    else:
+        excluded_subs = []
+    if not subs:
+        print(json.dumps({
+            "success": True, "added": 0, "channels_touched": 0,
+            "excluded_channels": [s["channel_title"] for s in excluded_subs],
+            "note": "All subscriptions are excluded by the configured channel exclusion list.",
+        }))
+        return
+
     channel_ids = [s["channel_id"] for s in subs]
     uploads_playlists = get_uploads_playlists(service, channel_ids)
 
@@ -696,8 +739,9 @@ def cmd_fetch(args):
         print(json.dumps({
             "success": True, "first_run": first_run, "added": 0,
             "channels_touched": 0, "total_channels_checked": len(subs),
+            "excluded_channels": [s["channel_title"] for s in excluded_subs],
             "note": "No new videos since last fetch.",
-        }))
+        }, ensure_ascii=False))
         return
 
     details_by_id = {v["id"]: v for v in get_video_details(service, all_video_ids)}
@@ -736,9 +780,10 @@ def cmd_fetch(args):
         "added": added_count,
         "channels_touched": len(channels_touched),
         "total_channels_checked": len(subs),
+        "excluded_channels": [s["channel_title"] for s in excluded_subs],
         "raw_dir": RAW_DIR,
         "note": "Written to raw/ only — run `ingest` to bring new videos into the wiki." if added_count else None,
-    }))
+    }, ensure_ascii=False))
 
 
 def cmd_refresh(args):
@@ -851,12 +896,21 @@ def find_raw_files_needing_transcript(limit=None):
     """Same cheap-dedup shape as find_uningested_raw_files: a small index
     read, not a per-file disk check. Only files whose video_id has a
     TERMINAL transcript-index entry are skipped — errored/never-attempted
-    videos are included every run."""
+    videos are included every run. Channels on the configured exclusion
+    list (config `excluded_channels`) are skipped entirely — matching on
+    the raw/ top-level channel folder, case-insensitively (same folder
+    names fetch writes from channel_title), so this also covers
+    tools/gentle_run.py, which calls this same helper."""
     already = transcript_processed_ids()
+    excluded = _excluded_channel_set()
     result = []
     if not os.path.isdir(RAW_DIR):
         return result
     for root, _dirs, files in os.walk(RAW_DIR):
+        if excluded:
+            rel_top = os.path.relpath(root, RAW_DIR).split(os.sep)[0]
+            if rel_top.lower() in excluded:
+                continue
         for fn in sorted(files):
             if not fn.endswith(".md") or fn.startswith("_"):
                 continue
@@ -1337,6 +1391,10 @@ def main():
     p_configure.add_argument("--wiki-root", required=True,
                               help="Root of the second-brain vault to write into (wiki/sources, "
                                    "wiki/concepts, wiki/entities, index.md, log.md go under here)")
+    p_configure.add_argument("--exclude-channel", action="append", default=None, metavar="NAME",
+                             help="Channel to exclude from fetch + transcript (repeatable; matches "
+                                  "case-insensitively). Omit to keep the currently configured "
+                                  "exclusion list; passing it replaces the list.")
 
     sub.add_parser("auth", help="Run the OAuth consent flow and cache a token")
     sub.add_parser("test", help="Verify auth and print account/subscription count")

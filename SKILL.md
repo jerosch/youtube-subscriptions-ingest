@@ -69,6 +69,8 @@ python scripts/youtube_subscriptions.py configure --raw-dir "<path>" --wiki-root
 ```
 This is safe to run against an existing vault — it only scaffolds `index.md`/`log.md` if they're genuinely missing, never overwrites real content. Confirm the resolved absolute paths back from the JSON it prints.
 
+**Channel exclusion** (added 2026-09-18): `configure` also takes `--exclude-channel NAME` (repeatable), stored as `excluded_channels` in the config JSON. Excluded channels are skipped by **fetch** (filtered before playlist resolution — zero API quota cost, reported as `excluded_channels` in the fetch JSON) and by the **transcript** phase (raw/ channel-folder match — covers both the `transcript` command and `tools/gentle_run.py`, which share the same helper). **Ingest is deliberately NOT affected**: already-archived videos of an excluded channel still land in the wiki. Matching is case-insensitive. A plain re-run of `configure` without the flag PRESERVES the existing list; passing the flag REPLACES it.
+
 ### B. YouTube auth (only if `test` reports not authenticated)
 
 1. Check auth: `python scripts/youtube_subscriptions.py test`

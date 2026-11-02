@@ -16,6 +16,7 @@ Every video becomes its own note, with a full description, clickable links to an
 - **`fetch`** — pulls verbatim video metadata (title, description, views, publish date) from every channel you're subscribed to, into a local `raw/` folder. No interpretation, just the facts.
 - **`transcript`** — pulls each video's caption track straight from YouTube (in the video's native language, or a configured fallback language — see "The transcript phase") into a sidecar file next to the raw metadata. Cached, throttled, and retrying on rate blocks — safe to re-run. Videos with captions off are marked "unavailable", not silently dropped.
 - **`ingest`** — processes `raw/` into your actual vault: one real note per video, plus auto-created/updated "concept" pages (topics like *Automation*, *CRM*, *Sales*) and "entity" pages (named things like *Claude*, *GoHighLevel*) that every relevant video links back to.
+- **Channel exclusion** — keep chosen channels out of the pipeline entirely: `configure --exclude-channel "Channel Name"` (repeatable). Exclusions apply to `fetch` and `transcript`; anything already ingested stays in your vault untouched.
 - **No artificial caps** — a channel that posted 500 videos in your chosen window gets all 500, not an arbitrary top-10.
 - **Safe to re-run anytime** — both phases dedupe by YouTube's own Video ID, so running `fetch`/`ingest` again never creates duplicates.
 - **Portable** — not hardcoded to any one project or vault. First run asks where you want the raw files and the wiki output to go.
@@ -95,6 +96,14 @@ That's it for the basics. `fetch` alone doesn't make anything searchable — `in
 All HTTP requests go through a session with connect/read timeouts (6s/30s) — a dead or hung connection surfaces as a retryable error instead of stalling the run indefinitely.
 
 **Proxying** (optional, for when YouTube rate-limits your IP): set `YT_WEBSHARE_USER` + `YT_WEBSHARE_PASS` in `.env` for a Webshare residential proxy, or `YT_PROXY_HTTP`/`YT_PROXY_HTTPS` for a standard proxy URL. For programmatic use, `fetch_transcript()` also accepts per-call `proxy_url=...` and `max_retries=...` overrides — the hook rotating multi-proxy runners build on.
+
+### Channel exclusion
+
+```bash
+python scripts/youtube_subscriptions.py configure --exclude-channel "Channel A" --exclude-channel "Channel B"
+```
+
+The list is stored in the config file and survives later `configure` runs (re-run without `--exclude-channel` to keep it; pass a new list to replace it). Matching is case-insensitive on the channel title. Excluded channels are skipped by `fetch` and `transcript` — already-ingested pages are never removed.
 
 ## Using this with an AI coding assistant (Claude Code, etc.)
 
