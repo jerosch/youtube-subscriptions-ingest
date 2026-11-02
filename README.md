@@ -105,6 +105,10 @@ python scripts/youtube_subscriptions.py configure --exclude-channel "Channel A" 
 
 The list is stored in the config file and survives later `configure` runs (re-run without `--exclude-channel` to keep it; pass a new list to replace it). Matching is case-insensitive on the channel title. Excluded channels are skipped by `fetch` and `transcript` — already-ingested pages are never removed.
 
+### How links work in this vault
+
+All links the tool writes into page *bodies* (concept/entity backlink bullets, `index.md`, `log.md`) use one shared mechanism: a percent-encoded Markdown link where **only spaces are encoded** — exactly what Obsidian's link resolver handles. `[[wikilinks]]` are avoided in bodies on purpose: source page filenames end in ` [Video ID]` (a nested-bracket wikilink truncates at the first `]`), and Obsidian cannot link to filenames containing `#` or `^` at all (they read as heading/block-ref markers, with no working escape) — so those characters are stripped from wiki page filenames. Frontmatter `sources: ["[[...]]"]` is the one exception; Obsidian's frontmatter reader handles it correctly and it stays as wikilinks.
+
 ## Using this with an AI coding assistant (Claude Code, etc.)
 
 `SKILL.md` in this repo is a full behavioral spec — copy it into your assistant's skills folder (for Claude Code: `.claude/skills/subscription-videos-metadata/SKILL.md`) and it'll drive the whole workflow conversationally: asking how far back to fetch, walking you through first-time setup, generating full reports on request, and so on, instead of you typing raw commands.

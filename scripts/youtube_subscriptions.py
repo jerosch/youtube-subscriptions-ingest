@@ -105,6 +105,7 @@ import json
 import os
 import re
 import sys
+import urllib.parse
 from datetime import datetime, timedelta, timezone
 
 try:
@@ -1068,10 +1069,38 @@ def render_description_block(description, video_url):
     )
 
 
+def sanitize_page_name(name, max_len=None):
+    """Filename for OBSIDIAN-LINKED pages (wiki source pages). Strips # and ^
+    on top of sanitize_filename: Obsidian treats those as heading/block-ref
+    markers inside [[links]] and as fragment separators in markdown links,
+    and there is no reliable escape — a file with # in its name cannot be
+    linked at all (Obsidian offers to create a new page instead; migration
+    of pre-existing pages 2026-11-02). raw/ files are never linked from the
+    vault, so they keep the unsanitized-for-obsidian naming."""
+    return sanitize_filename(re.sub(r"[#^]", "", name), max_len=max_len)
+
+
+def obsidian_md_link(display, abs_path, base_dir):
+    """Markdown link as Obsidian itself generates them: ONLY spaces are
+    percent-encoded, everything else stays raw. Full percent-encoding
+    backfires — Obsidian's resolver decodes %20 (and UTF-8 sequences) but
+    not %26/%27/%23, so an encoded & or ' or # breaks resolution (confirmed
+    in-vault 2026-11-02). Prerequisite: target filenames must not contain
+    # or ^ (see sanitize_page_name) — those are link-fragment markers with
+    no escape. Unbalanced ( ) in a path would terminate a bare destination
+    early per CommonMark; escape them (only in that case — balanced parens
+    are valid raw and Obsidian chokes on nothing there)."""
+    rel = os.path.relpath(abs_path, base_dir).replace(os.sep, "/").replace(" ", "%20")
+    if rel.count("(") != rel.count(")"):
+        rel = rel.replace("(", "\\(").replace(")", "\\)")
+    disp = display.replace("[", "\\[").replace("]", "\\]")
+    return f"[{disp}]({rel})"
+
+
 def source_page_path(channel_title, video_id, title):
-    d = os.path.join(SOURCES_DIR, sanitize_filename(channel_title))
+    d = os.path.join(SOURCES_DIR, sanitize_page_name(channel_title))
     os.makedirs(d, exist_ok=True)
-    filename = sanitize_filename(title, max_len=100) + f" [{video_id}].md"
+    filename = sanitize_page_name(title, max_len=100) + f" [{video_id}].md"
     return os.path.join(d, filename)
 
 
@@ -1093,8 +1122,19 @@ def write_source_page(raw_fields, links):
     all_tags = links["concepts"] + links["entities"]
     tags_yaml = "\n".join(f"  - {t}" for t in all_tags) if all_tags else "  []"
 
-    concept_links = "\n".join(f"- [[{CONCEPT_TAXONOMY[c]['name']}]]" for c in links["concepts"])
-    entity_links = "\n".join(f"- [[{ENTITY_TAXONOMY[e]['name']}]]" for e in links["entities"])
+    path = source_page_path(channel, video_id, title)
+    # Concept/entity links use the unified obsidian_md_link mechanism
+    # (percent-encoded Markdown link): the target files are <slug>.md, so a
+    # [[Name]] wikilink would not resolve for any name with spaces.
+    base_dir = os.path.dirname(path)
+    concept_links = "\n".join(
+        "- " + obsidian_md_link(CONCEPT_TAXONOMY[c]["name"],
+                                os.path.join(CONCEPTS_DIR, f"{c}.md"), base_dir)
+        for c in links["concepts"])
+    entity_links = "\n".join(
+        "- " + obsidian_md_link(ENTITY_TAXONOMY[e]["name"],
+                                os.path.join(ENTITIES_DIR, f"{e}.md"), base_dir)
+        for e in links["entities"])
 
     frontmatter = (
         "---\n"
@@ -1120,7 +1160,6 @@ def write_source_page(raw_fields, links):
         + (entity_links + "\n" if entity_links else "_None auto-detected._\n")
     )
 
-    path = source_page_path(channel, video_id, title)
     with open(path, "w", encoding="utf-8") as f:
         f.write(frontmatter + body)
     return path
@@ -1129,7 +1168,7 @@ def write_source_page(raw_fields, links):
 LINKED_SOURCES_HEADER = "## Linked Video Sources"
 
 
-def upsert_concept_or_entity_page(directory, slug, display_name, page_type, source_page_name):
+def upsert_concept_or_entity_page(directory, slug, display_name, page_type, source_page_name, source_abs):
     """Create a stub page if one doesn't exist yet, or append this source to
     an existing page (hand-written or previously auto-created) without
     touching any of its other content. Sources are tracked in a clearly
@@ -1137,6 +1176,15 @@ def upsert_concept_or_entity_page(directory, slug, display_name, page_type, sour
     prose a human (or a manual ingest pass) wrote elsewhere on the page."""
     path = os.path.join(directory, f"{slug}.md")
     is_new = not os.path.exists(path)
+
+    # Body bullets use percent-encoded MARKDOWN links, not [[wikilinks]]:
+    # page names end in " [Video ID]", and [[Name [ID]]] leaves a "]]]" that
+    # Obsidian's parser truncates — the bullet then offers to create a new
+    # page (confirmed in the real vault 2026-11-02; the quoted frontmatter
+    # "sources:" strings are unaffected and stay as [[...]]). Display text
+    # drops the " [Video ID]" suffix.
+    disp = re.sub(r" \[[A-Za-z0-9_-]{11}\]$", "", source_page_name)
+    link_line = "- " + obsidian_md_link(disp, source_abs, directory)
 
     # Quoted, not the bare [[Page]] flow-sequence style the one hand-written
     # example in this vault uses — video source page names embed a
@@ -1161,7 +1209,7 @@ def upsert_concept_or_entity_page(directory, slug, display_name, page_type, sour
             f"{LINKED_SOURCES_HEADER}\n\n"
             "_Auto-maintained by the youtube-video-subscriptions ingest process — "
             "edit the sections above freely, this list updates itself._\n\n"
-            f"- [[{source_page_name}]]\n"
+            f"{link_line}\n"
         )
         with open(path, "w", encoding="utf-8") as f:
             f.write(content)
@@ -1170,7 +1218,6 @@ def upsert_concept_or_entity_page(directory, slug, display_name, page_type, sour
     with open(path, encoding="utf-8") as f:
         content = f.read()
 
-    link_line = f"- [[{source_page_name}]]"
     if link_line in content:
         return path, False  # already linked, nothing to do
 
@@ -1211,7 +1258,7 @@ def update_index(new_concepts, updated_concepts, new_entities, updated_entities)
     with open(INDEX_PATH, encoding="utf-8") as f:
         content = f.read()
 
-    def add_lines(content, section_header, slugs, taxonomy):
+    def add_lines(content, section_header, slugs, taxonomy, directory):
         if not slugs:
             return content
         m = re.search(rf"(?m)^## {re.escape(section_header)}\n", content)
@@ -1225,7 +1272,17 @@ def update_index(new_concepts, updated_concepts, new_entities, updated_entities)
         section_body = re.sub(r"(?m)^\*\(none yet.*?\)\*\s*\n", "", section_body)
         for slug in slugs:
             name = taxonomy[slug]["name"]
-            if f"[[{name}]]" in section_body:
+            # Unified link mechanism: obsidian_md_link (percent-encoded
+            # Markdown link, same as feed and concept bullets). NOT
+            # [[Name]]: the page FILE is <slug>.md and Obsidian resolves
+            # wikilinks by filename — [[AI Video Generation]] matches
+            # nothing (file is ai-video.md) and offers to create a new page.
+            # Old wikilink forms count as "already listed" so a
+            # pre-migration index never duplicates entries.
+            target = os.path.relpath(os.path.join(directory, f"{slug}.md"),
+                                     os.path.dirname(INDEX_PATH)).replace(os.sep, "/")
+            if (target in section_body or f"[[{slug}|{name}]]" in section_body
+                    or f"[[{name}]]" in section_body):
                 continue
             stripped = section_body.rstrip("\n")
             last_line = stripped.rsplit("\n", 1)[-1] if stripped else ""
@@ -1237,7 +1294,9 @@ def update_index(new_concepts, updated_concepts, new_entities, updated_entities)
             # between a section's intro line and its first bullet, caught
             # in testing 2026-08-11.
             sep = "\n" if last_line.lstrip().startswith("- ") else "\n\n"
-            section_body = stripped + sep + f"- [[{name}]] — auto-linked from video ingest\n"
+            line = "- " + obsidian_md_link(name, os.path.join(directory, f"{slug}.md"),
+                                           os.path.dirname(INDEX_PATH))
+            section_body = stripped + sep + f"{line} — auto-linked from video ingest\n"
         # Always leave exactly one blank line before the next section header
         # (or EOF) — otherwise the next "## " heading runs directly against
         # the last bullet with no separating blank line, which markdown
@@ -1245,8 +1304,8 @@ def update_index(new_concepts, updated_concepts, new_entities, updated_entities)
         section_body = section_body.rstrip("\n") + "\n\n"
         return content[:section_start] + section_body + content[section_end:]
 
-    content = add_lines(content, "Concepts", new_concepts + updated_concepts, CONCEPT_TAXONOMY)
-    content = add_lines(content, "Entities", new_entities + updated_entities, ENTITY_TAXONOMY)
+    content = add_lines(content, "Concepts", new_concepts + updated_concepts, CONCEPT_TAXONOMY, CONCEPTS_DIR)
+    content = add_lines(content, "Entities", new_entities + updated_entities, ENTITY_TAXONOMY, ENTITIES_DIR)
 
     with open(INDEX_PATH, "w", encoding="utf-8") as f:
         f.write(content)
@@ -1263,13 +1322,21 @@ def append_log_entry(sources_created, new_concepts, updated_concepts, new_entiti
     concept_names = [CONCEPT_TAXONOMY[s]["name"] for s in sorted(set(new_concepts + updated_concepts))]
     entity_names = [ENTITY_TAXONOMY[s]["name"] for s in sorted(set(new_entities + updated_entities))]
 
+    def linked_names(slugs, taxonomy, directory):
+        # unified obsidian_md_link mechanism; [[Name]] would not resolve
+        # (target files are <slug>.md)
+        return ", ".join(
+            obsidian_md_link(taxonomy[s]["name"], os.path.join(directory, f"{s}.md"),
+                             os.path.dirname(LOG_PATH))
+            for s in slugs)
+
     entry = (
         f"\n## [{today()}] ingest | YouTube video batch ingest — {sources_created} videos\n\n"
         f"Ran `youtube_subscriptions.py ingest`. {sources_created} raw videos processed into "
         f"`wiki/sources/youtube-videos/`.\n\n"
-        f"Concepts: {len(new_concepts)} new ({', '.join(f'[[{n}]]' for n in [CONCEPT_TAXONOMY[s]['name'] for s in new_concepts]) or 'none'}), "
+        f"Concepts: {len(new_concepts)} new ({linked_names(new_concepts, CONCEPT_TAXONOMY, CONCEPTS_DIR) or 'none'}), "
         f"{len(updated_concepts)} updated with new sources.\n"
-        f"Entities: {len(new_entities)} new ({', '.join(f'[[{n}]]' for n in [ENTITY_TAXONOMY[s]['name'] for s in new_entities]) or 'none'}), "
+        f"Entities: {len(new_entities)} new ({linked_names(new_entities, ENTITY_TAXONOMY, ENTITIES_DIR) or 'none'}), "
         f"{len(updated_entities)} updated with new sources.\n"
     )
     with open(LOG_PATH, "w", encoding="utf-8") as f:
@@ -1355,13 +1422,13 @@ def cmd_ingest(args):
 
         for slug in links["concepts"]:
             _, was_new = upsert_concept_or_entity_page(
-                CONCEPTS_DIR, slug, CONCEPT_TAXONOMY[slug]["name"], "concept", source_name
+                CONCEPTS_DIR, slug, CONCEPT_TAXONOMY[slug]["name"], "concept", source_name, source_path
             )
             (new_concepts if was_new else updated_concepts).add(slug)
 
         for slug in links["entities"]:
             _, was_new = upsert_concept_or_entity_page(
-                ENTITIES_DIR, slug, ENTITY_TAXONOMY[slug]["name"], "entity", source_name
+                ENTITIES_DIR, slug, ENTITY_TAXONOMY[slug]["name"], "entity", source_name, source_path
             )
             (new_entities if was_new else updated_entities).add(slug)
 
