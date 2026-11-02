@@ -188,6 +188,15 @@ Regenerates `<wiki_root>/feed.md` — every ingested video grouped newest-first 
 
 **Page-naming rule (added 2026-11-02, migration of 1,537 pages same day):** wiki source page filenames must never contain `#` or `^` — Obsidian treats them as heading/block-ref markers in `[[links]]` and as fragment separators in Markdown links, and there is no reliable escape (`%23` is NOT decoded by Obsidian; a raw `#` becomes a heading anchor → clicking offers "create new page"). `sanitize_page_name()` strips them for all wiki pages; raw/ files are never linked from the vault so they keep the verbatim title. If a future Obsidian link mysteriously creates a duplicate page, check the target filename for `#`/`^` first.
 
+### 4d. Thumbnails (added 2026-11-02)
+
+Run:
+```
+python scripts/youtube_subscriptions.py thumbnails [--limit N]
+```
+
+Downloads `https://i.ytimg.com/vi/<id>/hqdefault.jpg` (480x360 — exists for every video, unlike maxresdefault) for every **already-ingested** video into `<wiki_root>/wiki/sources/youtube-videos/_thumbnails/<video_id>.jpg`, embeds `![Thumbnail|320](../_thumbnails/<id>.jpg)` right after the `**Views:**` line of the source page (idempotent: replaces an existing line), and the feed's Thumbnail column shows `![Thumbnail\|140](…)` (`—` when missing). Dedup via `raw/youtube-videos/_thumbnail-index.tsv` (ok/unavailable terminal; transient errors retried next run). Tuning via `YT_THUMBNAIL_THROTTLE_S` (default 0.2), `YT_THUMBNAIL_TIMEOUT_S`, `YT_THUMBNAIL_RETRIES`. Videos ingested after a run are picked up by the next `thumbnails` run; new pages written by `ingest` embed the image automatically when the file already exists.
+
 ### 5. Show Local
 
 Ask (via `AskUserQuestion`): researching a topic, browsing a specific channel, or the whole archive?

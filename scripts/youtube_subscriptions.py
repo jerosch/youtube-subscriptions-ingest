@@ -108,7 +108,9 @@ import subprocess
 import sys
 import tempfile
 import time
+import urllib.error
 import urllib.parse
+import urllib.request
 from datetime import datetime, timedelta, timezone
 
 try:
@@ -144,12 +146,14 @@ RAW_INDEX_PATH = None
 TRANSCRIPT_INDEX_PATH = None
 INGEST_INDEX_PATH = None
 SUMMARY_INDEX_PATH = None
+THUMBNAIL_INDEX_PATH = None
 SOURCES_DIR = None
 CONCEPTS_DIR = None
 ENTITIES_DIR = None
 INDEX_PATH = None
 LOG_PATH = None
 FEED_PATH = None
+THUMBS_DIR = None
 # Channel titles excluded from the pipeline (config key `excluded_channels`).
 # Lower-cased at apply time; matched case-insensitively against both the
 # YouTube subscription channel_title (fetch) and the raw/ top-level channel
@@ -173,8 +177,8 @@ def apply_config():
     """Populates the module-level path globals from the saved config.
     Call this at the top of any command that reads/writes raw/ or wiki/
     (not needed for auth/test/configure)."""
-    global RAW_DIR, RAW_INDEX_PATH, TRANSCRIPT_INDEX_PATH, INGEST_INDEX_PATH, SUMMARY_INDEX_PATH
-    global SOURCES_DIR, CONCEPTS_DIR, ENTITIES_DIR, INDEX_PATH, LOG_PATH, FEED_PATH
+    global RAW_DIR, RAW_INDEX_PATH, TRANSCRIPT_INDEX_PATH, INGEST_INDEX_PATH, SUMMARY_INDEX_PATH, THUMBNAIL_INDEX_PATH
+    global SOURCES_DIR, CONCEPTS_DIR, ENTITIES_DIR, INDEX_PATH, LOG_PATH, FEED_PATH, THUMBS_DIR
     global EXCLUDED_CHANNELS
     cfg = load_config()
     if not cfg:
@@ -190,12 +194,14 @@ def apply_config():
     TRANSCRIPT_INDEX_PATH = os.path.join(raw_dir, "_transcript-index.tsv")
     INGEST_INDEX_PATH = os.path.join(raw_dir, "_ingest-index.tsv")
     SUMMARY_INDEX_PATH = os.path.join(raw_dir, "_summary-index.tsv")
+    THUMBNAIL_INDEX_PATH = os.path.join(raw_dir, "_thumbnail-index.tsv")
     SOURCES_DIR = os.path.join(wiki_root, "wiki", "sources", "youtube-videos")
     CONCEPTS_DIR = os.path.join(wiki_root, "wiki", "concepts")
     ENTITIES_DIR = os.path.join(wiki_root, "wiki", "entities")
     INDEX_PATH = os.path.join(wiki_root, "index.md")
     LOG_PATH = os.path.join(wiki_root, "log.md")
     FEED_PATH = os.path.join(wiki_root, "feed.md")
+    THUMBS_DIR = os.path.join(SOURCES_DIR, "_thumbnails")
 
 
 def cmd_configure(args):
@@ -1152,12 +1158,14 @@ def write_source_page(raw_fields, links):
         "sources: []\n"
         "---\n\n"
     )
+    thumb = thumbnail_md(video_id, os.path.dirname(path), THUMB_WIDTH_PAGE)
     body = (
         f"# {title}\n\n"
         f"**Channel:** {channel}\n"
         f"**Video:** {url}\n"
         f"**Views:** {raw_fields.get('views', 'N/A')} · **Published:** {raw_fields.get('published', '')}\n\n"
-        "## Description\n\n"
+        + (thumb + "\n\n" if thumb else "")
+        + "## Description\n\n"
         f"{render_description_block(raw_fields['description'], url)}\n\n"
         f"{TRANSCRIPT_HEADING}\n\n"
         + (raw_fields.get("transcript") or "_Not fetched yet — run `transcript` before `ingest` to include this._") + "\n\n"
@@ -1676,10 +1684,13 @@ def regenerate_feed():
             lines += [f"## {MONTH_NAMES.get(int(month), month)} {year}", ""]
         if day != cur_day:
             cur_day = day
-            lines += [f"### {year}-{month}-{day}", "", "| Video | Hashtags | Channel |", "| --- | --- | --- |"]
+            lines += [f"### {year}-{month}-{day}", "", "| Thumbnail | Video | Hashtags | Channel |", "| --- | --- | --- | --- |"]
         raw_info = raw_by_id.get(vid) or {}
         tags = extract_title_hashtags(raw_info["raw_path"]) if raw_info.get("raw_path") else ""
-        lines.append(f"| {md_link(src_abs, vid)} | {tags or '—'} | {esc(channel)} |")
+        thumb = thumbnail_md(vid, wiki_root, THUMB_WIDTH_FEED)
+        # escaped pipe: a bare | inside the cell would split the table column
+        thumb = thumb.replace("|", "\\|") if thumb else "—"
+        lines.append(f"| {thumb} | {md_link(src_abs, vid)} | {tags or '—'} | {esc(channel)} |")
     tmp = FEED_PATH + ".tmp"
     with open(tmp, "w", encoding="utf-8") as f:
         f.write("\n".join(lines) + "\n")
@@ -1691,6 +1702,184 @@ def cmd_feed(args):
     apply_config()
     n = regenerate_feed()
     print(json.dumps({"success": True, "feed_path": FEED_PATH, "entries": n}))
+
+
+# ---------------------------------------------------------------------------
+# Thumbnails (added 2026-11-02): download each ingested video's YouTube
+# thumbnail into the vault, embed it on the video's source page, and show it
+# in the feed table. i.ytimg.com/vi/<id>/hqdefault.jpg (480x360) exists for
+# every video — maxresdefault only for some — so hqdefault is the reliable
+# choice. Index-deduped like every other phase: resumable, safe to re-run.
+# ---------------------------------------------------------------------------
+
+THUMBNAIL_INDEX_HEADER = "video_id\tstatus\tthumbnail\n"
+THUMB_WIDTH_PAGE = 320  # display width on the source page (px)
+THUMB_WIDTH_FEED = 140  # display width in the feed table (px)
+
+
+class ThumbnailMissing(Exception):
+    """Terminal: no thumbnail to fetch for this video (404 / placeholder)."""
+
+
+def thumbnail_config():
+    return {
+        "throttle_s": float(os.environ.get("YT_THUMBNAIL_THROTTLE_S", "0.2")),
+        "timeout_s": float(os.environ.get("YT_THUMBNAIL_TIMEOUT_S", "15")),
+        "retries": int(os.environ.get("YT_THUMBNAIL_RETRIES", "2")),
+    }
+
+
+def read_thumbnail_index_rows():
+    if not os.path.exists(THUMBNAIL_INDEX_PATH):
+        return []
+    with open(THUMBNAIL_INDEX_PATH, encoding="utf-8") as f:
+        lines = f.readlines()
+    rows = []
+    for line in lines[1:]:
+        parts = line.rstrip("\n").split("\t")
+        if len(parts) == 3:
+            rows.append({"video_id": parts[0], "status": parts[1], "thumbnail": parts[2]})
+    return rows
+
+
+def thumbnail_done_ids():
+    return {r["video_id"] for r in read_thumbnail_index_rows()}
+
+
+def append_thumbnail_index_rows(rows):
+    is_new = not os.path.exists(THUMBNAIL_INDEX_PATH)
+    with open(THUMBNAIL_INDEX_PATH, "a", encoding="utf-8") as f:
+        if is_new:
+            f.write(THUMBNAIL_INDEX_HEADER)
+        for r in rows:
+            f.write(f"{r['video_id']}\t{r['status']}\t{r['thumbnail']}\n")
+
+
+def thumbnail_path(video_id):
+    return os.path.join(THUMBS_DIR, f"{video_id}.jpg")
+
+
+def thumbnail_md(video_id, base_dir, width):
+    """Image markdown for a downloaded thumbnail ('' when not on disk).
+    Filenames are <video_id>.jpg — URL-safe by construction (no spaces,
+    parens or #), so no further escaping is needed. The |width sizing
+    syntax keeps feed cells and pages readable despite 480x360 sources."""
+    path = thumbnail_path(video_id)
+    if not os.path.exists(path):
+        return ""
+    rel = os.path.relpath(path, base_dir).replace(os.sep, "/")
+    return f"![Thumbnail|{width}]({rel})"
+
+
+def download_thumbnail(video_id, cfg):
+    """Returns image bytes; raises ThumbnailMissing (terminal) or the last
+    transient error. YouTube serves a small grey placeholder JPEG for videos
+    without even an hqdefault — treated as missing by size."""
+    url = f"https://i.ytimg.com/vi/{video_id}/hqdefault.jpg"
+    last_err = None
+    for attempt in range(cfg["retries"] + 1):
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+            with urllib.request.urlopen(req, timeout=cfg["timeout_s"]) as r:
+                data = r.read()
+            if len(data) < 2000:  # grey 120x90 placeholder
+                raise ThumbnailMissing(url)
+            return data
+        except urllib.error.HTTPError as e:
+            if e.code == 404:
+                raise ThumbnailMissing(url)
+            last_err = f"http {e.code}"
+        except Exception as e:
+            last_err = str(e)[:120]
+        time.sleep(2 ** (attempt + 1))
+    raise RuntimeError(f"thumbnail fetch failed after {cfg['retries'] + 1} attempts: {last_err}")
+
+
+THUMB_LINE_RE = re.compile(r"(?m)^!\[Thumbnail.*$")
+
+
+def embed_thumbnail_in_source_page(page_path, video_id):
+    """Idempotent: inserts (or replaces) the thumbnail image line directly
+    after the **Views:** header line of an existing source page. Returns
+    True when the page changed."""
+    if not (os.path.exists(page_path) and os.path.exists(thumbnail_path(video_id))):
+        return False
+    with open(page_path, encoding="utf-8") as f:
+        content = f.read()
+    line = thumbnail_md(video_id, os.path.dirname(page_path), THUMB_WIDTH_PAGE)
+    if THUMB_LINE_RE.search(content):
+        if THUMB_LINE_RE.search(content).group(0) == line:
+            return False
+        new_content = THUMB_LINE_RE.sub(lambda m: line, content, count=1)
+    else:
+        anchor = None
+        for l in content.split("\n"):
+            if l.startswith("**Views:**"):
+                anchor = l
+                break
+        if anchor is None:
+            return False
+        new_content = content.replace(anchor, anchor + "\n\n" + line, 1)
+    with open(page_path, "w", encoding="utf-8") as f:
+        f.write(new_content)
+    return True
+
+
+def cmd_thumbnails(args):
+    apply_config()
+    os.makedirs(THUMBS_DIR, exist_ok=True)
+    cfg = thumbnail_config()
+
+    ingested = []
+    if os.path.exists(INGEST_INDEX_PATH):
+        with open(INGEST_INDEX_PATH, encoding="utf-8") as f:
+            for line in f.readlines()[1:]:
+                parts = line.rstrip("\n").split("\t")
+                if len(parts) >= 2 and parts[0]:
+                    ingested.append((parts[0], parts[1]))
+    done = thumbnail_done_ids()
+
+    downloaded = missing = errors = processed = 0
+    index_rows = []
+    for vid, src in ingested:
+        if vid in done:
+            continue
+        if args.limit and processed >= args.limit:
+            break
+        now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        try:
+            data = download_thumbnail(vid, cfg)
+        except ThumbnailMissing:
+            index_rows.append({"video_id": vid, "status": "unavailable", "thumbnail": now})
+            missing += 1
+            continue
+        except Exception as e:
+            errors += 1
+            print(f"error {vid}: {e}", file=sys.stderr)
+            continue  # not indexed — retried next run
+        with open(thumbnail_path(vid), "wb") as f:
+            f.write(data)
+        embed_thumbnail_in_source_page(src, vid)
+        index_rows.append({"video_id": vid, "status": "ok", "thumbnail": now})
+        downloaded += 1
+        processed += 1
+        if len(index_rows) >= 100:
+            append_thumbnail_index_rows(index_rows)
+            index_rows = []
+        if cfg["throttle_s"]:
+            time.sleep(cfg["throttle_s"])
+    if index_rows:
+        append_thumbnail_index_rows(index_rows)
+
+    remaining = max(0, len(ingested) - len(thumbnail_done_ids()))
+    print(json.dumps({
+        "success": True,
+        "downloaded": downloaded,
+        "unavailable": missing,
+        "errors_this_run": errors,
+        "remaining_without_thumbnail": remaining,
+        "thumb_dir": THUMBS_DIR,
+    }))
 
 
 def cmd_ingest(args):
@@ -1801,11 +1990,16 @@ def main():
 
     sub.add_parser("feed", help="Regenerate feed.md (chronological link list of all ingested videos)")
 
+    p_thumbnails = sub.add_parser("thumbnails", help="Download YouTube thumbnails for ingested videos into the vault, embed them on source pages and in the feed (resumable)")
+    p_thumbnails.add_argument("--limit", type=int, default=None,
+                              help="Only fetch the first N thumbnails still missing (for testing before a full run)")
+
     args = parser.parse_args()
     {
         "configure": cmd_configure, "auth": cmd_auth, "test": cmd_test,
         "fetch": cmd_fetch, "refresh": cmd_refresh, "transcript": cmd_transcript,
         "ingest": cmd_ingest, "summarize": cmd_summarize, "feed": cmd_feed,
+        "thumbnails": cmd_thumbnails,
     }[args.command](args)
 
 

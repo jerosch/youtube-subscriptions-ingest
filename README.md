@@ -17,7 +17,8 @@ Every video becomes its own note, with a full description, clickable links to an
 - **`transcript`** — pulls each video's caption track straight from YouTube (in the video's native language, or a configured fallback language — see "The transcript phase") into a sidecar file next to the raw metadata. Cached, throttled, and retrying on rate blocks — safe to re-run. Videos with captions off are marked "unavailable", not silently dropped.
 - **`ingest`** — processes `raw/` into your actual vault: one real note per video, plus auto-created/updated "concept" pages (topics like *Automation*, *CRM*, *Sales*) and "entity" pages (named things like *Claude*, *GoHighLevel*) that every relevant video links back to.
 - **`summarize`** *(optional)* — generates a short AI summary of each video's transcript and writes it onto the video's source page. Runs through the [`pi` CLI](https://github.com/badlogic/pi-mono), one stateless ephemeral session per video, so summaries can never influence each other. Idempotent and resumable (see "The summarize phase").
-- **`feed`** — regenerates a chronological `feed.md` at the vault root: every ingested video, grouped by year → month → day, one table per day (`Video | Hashtags | Channel`). `ingest` refreshes it automatically at the end of every run.
+- **`feed`** — regenerates a chronological `feed.md` at the vault root: every ingested video, grouped by year → month → day, one table per day (`Thumbnail | Video | Hashtags | Channel`). `ingest` refreshes it automatically at the end of every run.
+- **`thumbnails`** — downloads each ingested video's YouTube thumbnail (`hqdefault`, 480×360) into the vault, embeds it on the video's source page and shows it in the feed table. Index-deduped and resumable like every other phase.
 - **Channel exclusion** — keep chosen channels out of the pipeline entirely: `configure --exclude-channel "Channel Name"` (repeatable). Exclusions apply to `fetch` and `transcript`; anything already ingested stays in your vault untouched.
 - **No artificial caps** — a channel that posted 500 videos in your chosen window gets all 500, not an arbitrary top-10.
 - **Safe to re-run anytime** — both phases dedupe by YouTube's own Video ID, so running `fetch`/`ingest` again never creates duplicates.
@@ -87,6 +88,9 @@ python scripts/youtube_subscriptions.py summarize
 
 # Regenerate the chronological feed page (ingest already does this automatically)
 python scripts/youtube_subscriptions.py feed
+
+# Download thumbnails for ingested videos (source pages + feed), resumable
+python scripts/youtube_subscriptions.py thumbnails
 ```
 
 That's it for the basics. `fetch` alone doesn't make anything searchable — `ingest` is the step that builds the actual knowledge graph.
