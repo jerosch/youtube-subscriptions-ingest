@@ -18,7 +18,7 @@ Every video becomes its own note, with a full description, clickable links to an
 - **`ingest`** — processes `raw/` into your actual vault: one real note per video, plus auto-created/updated "concept" pages (topics like *Automation*, *CRM*, *Sales*) and "entity" pages (named things like *Claude*, *GoHighLevel*) that every relevant video links back to.
 - **`summarize`** *(optional)* — generates a short AI summary of each video's transcript and writes it onto the video's source page. Runs through the [`pi` CLI](https://github.com/badlogic/pi-mono), one stateless ephemeral session per video, so summaries can never influence each other. Idempotent and resumable (see "The summarize phase").
 - **`reformat`** *(optional)* — inserts paragraphs and `###` topic headings into existing transcripts on the source pages, so they read as structured text instead of one flat block. Also a `pi` pass per video, word-preserving (verified output must retain ≥80 % of the transcript's words or the video is retried). Raw sidecars stay verbatim (see "The reformat phase").
-- **`feed`** — regenerates a chronological `feed.md` at the vault root: every ingested video, grouped by year → month → day, one table per day (`Thumbnail | Video | Hashtags | Channel`). `ingest` refreshes it automatically at the end of every run.
+- **`feed`** — regenerates a chronological feed at the vault root: every ingested video, newest first. Split for readability into `feed.md` (index: last 7 days inline + links to every month) and per-month files `feed/<YYYY>/<YYYY-MM>.md` (one table per day: `Thumbnail | Video | Hashtags | Channel`). `ingest` refreshes it automatically at the end of every run.
 - **`thumbnails`** — downloads each ingested video's YouTube thumbnail (`hqdefault`, 480×360) into the vault, embeds it on the video's source page and shows it in the feed table. Index-deduped and resumable like every other phase.
 - **Channel exclusion** — keep chosen channels out of the pipeline entirely: `configure --exclude-channel "Channel Name"` (repeatable). Exclusions apply to `fetch` and `transcript`; anything already ingested stays in your vault untouched.
 - **No artificial caps** — a channel that posted 500 videos in your chosen window gets all 500, not an arbitrary top-10.
@@ -140,7 +140,12 @@ The list is stored in the config file and survives later `configure` runs (re-ru
 
 ### The feed page
 
-`feed.md` is fully rebuilt from the fetch + ingest indexes on every `ingest`/`feed` run, so it can never drift from the actual archive. Video cells link the source pages using the link mechanism described below, and show the hashtags found in the original video title (`—` when the title has none).
+The feed is fully rebuilt from the fetch + ingest indexes on every `ingest`/`feed` run, so it can never drift from the actual archive. Since 2026-11-04 it is split by time instead of living in one file (a single `feed.md` past ~9k thumbnail-bearing table rows renders sluggishly in Obsidian):
+
+- **`feed.md`** — the entry point: the last 7 days inline as day tables, then a `## Monate` index linking every month file with its entry count.
+- **`feed/<YYYY>/<YYYY-MM>.md`** — one file per month (year subfolders), day tables newest-first inside.
+
+Video cells link the source pages using the link mechanism described below, and show the hashtags found in the original video title (`—` when the title has none). Month files no longer backed by the indexes are deleted on the next run.
 
 ### How links work in this vault
 

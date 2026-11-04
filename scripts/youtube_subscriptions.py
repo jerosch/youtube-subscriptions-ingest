@@ -1825,6 +1825,16 @@ def extract_title_hashtags(raw_path):
 
 
 def regenerate_feed():
+    """Rebuild the feed from the indexes — never edited incrementally, so it
+    can never drift. Split into per-month files (added 2026-11-04) because a
+    single feed.md past ~9k table rows (with thumbnails) renders sluggishly
+    in Obsidian:
+
+      feed.md                      index: last 7 days inline + month links
+      feed/<YYYY>/<YYYY-MM>.md     one file per month, day tables inside
+
+    Every file is fully rewritten each run; month files no longer backed by
+    the indexes are deleted."""
     raw_by_id = {r["video_id"]: r for r in read_raw_index_rows()}
     entries = []
     if os.path.exists(INGEST_INDEX_PATH):
@@ -1843,9 +1853,10 @@ def regenerate_feed():
         # pipe and newlines break markdown table cells
         return s.replace("|", "\\|").replace("\n", " ").strip()
 
-    wiki_root = os.path.dirname(FEED_PATH)
+    vault_root = os.path.dirname(FEED_PATH)
+    feed_dir = os.path.join(vault_root, "feed")
 
-    def md_link(src_abs, vid):
+    def md_link(src_abs, vid, base_dir):
         """Markdown link (not [[wikilink]]): the source page filename ends in
         ' [Video ID]', and a nested-bracket wikilink [[Title [ID]]] truncates
         at the first ']]' run in Obsidian's parser. Visible text drops the
@@ -1853,38 +1864,90 @@ def regenerate_feed():
         name = page_name(src_abs)
         suffix = f" [{vid}]"
         disp = name[: -len(suffix)] if name.endswith(suffix) else name
-        return obsidian_md_link(disp, src_abs, wiki_root)
+        return obsidian_md_link(disp, src_abs, base_dir)
+
+    def day_rows(day_entries, base_dir):
+        out = ["| Thumbnail | Video | Hashtags | Channel |", "| --- | --- | --- | --- |"]
+        for published, channel, vid, src_abs in day_entries:
+            raw_info = raw_by_id.get(vid) or {}
+            tags = extract_title_hashtags(raw_info["raw_path"]) if raw_info.get("raw_path") else ""
+            thumb = thumbnail_md(vid, base_dir, THUMB_WIDTH_FEED)
+            # escaped pipe: a bare | inside the cell would split the table column
+            thumb = thumb.replace("|", "\\|") if thumb else "—"
+            out.append(f"| {thumb} | {md_link(src_abs, vid, base_dir)} | {tags or '—'} | {esc(channel)} |")
+        return out
 
     MONTH_NAMES = {1: "Januar", 2: "Februar", 3: "März", 4: "April", 5: "Mai", 6: "Juni",
                    7: "Juli", 8: "August", 9: "September", 10: "Oktober", 11: "November", 12: "Dezember"}
 
-    # Group newest-first: year (h1) > month (h2) > day (h3), one table per day.
-    # Entries are already sorted desc, so a flat walk with change-detection keeps
-    # the nesting correct without a separate grouping pass.
+    # Group newest-first: (year, month) -> day -> entries. Entries are already
+    # sorted desc, so insertion order keeps everything newest-first.
+    months = {}
+    by_day = {}
+    for entry in entries:
+        published = entry[0]
+        year, month, day = published[:4], published[5:7], published[8:10]
+        months.setdefault((year, month), {}).setdefault(day, []).append(entry)
+        by_day.setdefault(f"{year}-{month}-{day}", []).append(entry)
+    stamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+
+    # --- per-month files: feed/<YYYY>/<YYYY-MM>.md -------------------------
+    written = set()
+    for (year, month), days in months.items():
+        count = sum(len(v) for v in days.values())
+        lines = [f"# {MONTH_NAMES.get(int(month), month)} {year}", "",
+                 f"_Auto-generiert von `ingest`/`feed`, nicht manuell bearbeiten. "
+                 f"{count} Einträge, Stand {stamp}._", ""]
+        for day, day_entries in days.items():
+            lines += [f"## {year}-{month}-{day}", ""] + day_rows(day_entries, os.path.join(feed_dir, year)) + [""]
+        path = os.path.join(feed_dir, year, f"{year}-{month}.md")
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        tmp = path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            f.write("\n".join(lines) + "\n")
+        os.replace(tmp, path)
+        written.add(path)
+
+    # Drop month files the indexes no longer back (and empty year dirs).
+    if os.path.isdir(feed_dir):
+        for ydir in sorted(os.listdir(feed_dir)):
+            ypath = os.path.join(feed_dir, ydir)
+            if not os.path.isdir(ypath):
+                continue
+            for fn in sorted(os.listdir(ypath)):
+                if fn.endswith(".md") and os.path.join(ypath, fn) not in written:
+                    os.remove(os.path.join(ypath, fn))
+            try:
+                os.rmdir(ypath)
+            except OSError:
+                pass
+
+    # --- feed.md: last 7 days inline + month index -------------------------
     lines = [
         "**Feed** — alle ingesteten Videos, neueste zuerst. Auto-generiert von "
         f"`ingest`/`feed`, nicht manuell bearbeiten. {len(entries)} Einträge, "
-        f"Stand {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}.",
+        f"Stand {stamp}.",
+        "",
+        "## Letzte 7 Tage",
         "",
     ]
-    cur_year = cur_month = cur_day = None
-    for published, channel, vid, src_abs in entries:
-        year, month, day = published[:4], published[5:7], published[8:10]
-        if year != cur_year:
-            cur_year, cur_month, cur_day = year, None, None
-            lines += [f"# {year}", ""]
-        if month != cur_month:
-            cur_month, cur_day = month, None
-            lines += [f"## {MONTH_NAMES.get(int(month), month)} {year}", ""]
-        if day != cur_day:
-            cur_day = day
-            lines += [f"### {year}-{month}-{day}", "", "| Thumbnail | Video | Hashtags | Channel |", "| --- | --- | --- | --- |"]
-        raw_info = raw_by_id.get(vid) or {}
-        tags = extract_title_hashtags(raw_info["raw_path"]) if raw_info.get("raw_path") else ""
-        thumb = thumbnail_md(vid, wiki_root, THUMB_WIDTH_FEED)
-        # escaped pipe: a bare | inside the cell would split the table column
-        thumb = thumb.replace("|", "\\|") if thumb else "—"
-        lines.append(f"| {thumb} | {md_link(src_abs, vid)} | {tags or '—'} | {esc(channel)} |")
+    today = datetime.now(timezone.utc).date()
+    recent_hit = False
+    for i in range(7):
+        day = (today - timedelta(days=i)).isoformat()
+        day_entries = by_day.get(day)
+        if not day_entries:
+            continue  # days without videos are omitted
+        recent_hit = True
+        lines += [f"### {day}", ""] + day_rows(day_entries, vault_root) + [""]
+    if not recent_hit:
+        lines += ["_derzeit keine Einträge in den letzten 7 Tagen_", ""]
+    lines += ["## Monate", ""]
+    for (year, month), days in months.items():
+        count = sum(len(v) for v in days.values())
+        path = os.path.join(feed_dir, year, f"{year}-{month}.md")
+        label = f"{MONTH_NAMES.get(int(month), month)} {year}"
+        lines.append(f"- {obsidian_md_link(label, path, vault_root)} ({count})")
     tmp = FEED_PATH + ".tmp"
     with open(tmp, "w", encoding="utf-8") as f:
         f.write("\n".join(lines) + "\n")
@@ -1895,7 +1958,7 @@ def regenerate_feed():
 def cmd_feed(args):
     apply_config()
     n = regenerate_feed()
-    print(json.dumps({"success": True, "feed_path": FEED_PATH, "entries": n}))
+    print(json.dumps({"success": True, "feed_path": FEED_PATH, "feed_dir": os.path.join(os.path.dirname(FEED_PATH), "feed"), "entries": n}))
 
 
 # ---------------------------------------------------------------------------
