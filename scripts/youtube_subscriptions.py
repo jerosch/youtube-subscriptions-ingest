@@ -1669,19 +1669,71 @@ def append_reformat_index_rows(rows):
             f.write(f"{r['video_id']}\t{r['status']}\t{r['reformatted']}\n")
 
 
+def _apply_reformat_plan(transcript, plan):
+    """Splice insertion instructions into the transcript locally. Each plan
+    line is 'HEADING|<heading>|<anchor>' or 'BREAK|<anchor>', where <anchor>
+    is the first few words of the new paragraph, quoted verbatim by the
+    model. The spoken words are preserved exactly by construction — the
+    model points at positions instead of regenerating the text. Anchors are
+    searched from the previous insertion point on, which enforces transcript
+    order; an anchor the model paraphrased is skipped (partial formatting is
+    still an improvement over none). Returns (text, applied, planned)."""
+    insertions = []
+    pos = 0
+    planned = 0
+    for line in plan.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        parts = line.split("|")
+        kind = parts[0].strip().upper()
+        if kind == "HEADING" and len(parts) >= 3:
+            heading, anchor = parts[1].strip(), " ".join(parts[2:]).strip()
+        elif kind == "BREAK" and len(parts) >= 2:
+            heading, anchor = "", " ".join(parts[1:]).strip()
+        else:
+            continue
+        anchor = re.sub(r'^["„»\']+|["“»\.!,;:]+$', "", anchor).strip()
+        words = anchor.split()
+        if not words:
+            continue
+        planned += 1
+        pat = re.compile(r"\b" + r"\s+".join(re.escape(w) for w in words), re.IGNORECASE)
+        m = pat.search(transcript, pos)
+        if not m:
+            continue
+        insertions.append((m.start(), heading))
+        pos = m.start()
+    pieces = []
+    prev = 0
+    for p, heading in insertions:
+        pieces.append(transcript[prev:p].rstrip())
+        pieces.append(("\n\n### " + heading + "\n\n") if heading else "\n\n")
+        prev = p
+    pieces.append(transcript[prev:].rstrip())
+    return "".join(pieces).strip(), len(insertions), planned
+
+
 def reformat_one_video(transcript, cfg):
-    """One headless pi call: insert paragraph breaks and short ### headings,
-    never touch the spoken words. The word-count guard rejects outputs where
-    the model summarized, truncated or refused instead of formatting."""
+    """One headless pi call returning insertion instructions instead of the
+    whole transcript (rework 2026-11-05): echoing the full text made output
+    tokens ~= input tokens per video, which is the bottleneck on the shared
+    LLM engine. A plan costs a few tokens per paragraph break/heading, and
+    _apply_reformat_plan splices it locally — word preservation is exact by
+    construction, so the old >=80%-word-count guard is obsolete. The retry
+    guard now checks how many anchors actually resolved in the transcript."""
     system = (
-        "You format a raw YouTube video transcript for reading. Insert blank "
-        "lines to form paragraphs and short markdown '###' headings where the "
-        "topic changes (2-6 words each, in the same language as the transcript). "
-        "Hard rule: never change, add, or remove any word of the spoken text "
-        "itself — only whitespace and headings. No preamble, no commentary, no "
-        "code fences. Output only the formatted transcript."
+        "You mark formatting positions in a raw YouTube video transcript. "
+        "Never output the transcript itself — output ONLY instruction lines, "
+        "one per line, in transcript order:\n"
+        "HEADING|<2-6 word heading in the transcript's language>|<anchor>\n"
+        "BREAK|<anchor>\n"
+        "Use HEADING at each topic change (roughly one every 100-200 words), "
+        "BREAK for a paragraph break without a new topic. <anchor> = the "
+        "first 5-8 words of the new paragraph, copied VERBATIM from the "
+        "transcript (same words, same order, no edits). No other text."
     )
-    user = "Format the transcript from the given file."
+    user = "Mark the formatting positions in the transcript from the given file."
     fd, tmp_path = tempfile.mkstemp(prefix="yt_fmt_", suffix=".txt")
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as f:
@@ -1691,7 +1743,6 @@ def reformat_one_video(transcript, cfg):
             cmd += ["--model", cfg["model"]]
         cmd += [f"@{tmp_path}", user]
         last_err = None
-        min_words = int(len(transcript.split()) * 0.8)
         for attempt in range(cfg["retries"] + 1):
             try:
                 r = subprocess.run(cmd, capture_output=True, text=True, timeout=cfg["timeout_s"])
@@ -1699,10 +1750,10 @@ def reformat_one_video(transcript, cfg):
                 if r.returncode == 0 and out:
                     if out.startswith("```"):
                         out = re.sub(r"^```[a-zA-Z]*\n?|```$", "", out).strip()
-                    if len(out.split()) >= min_words:
-                        return out
-                    last_err = (f"output has {len(out.split())} words, expected "
-                                f">= {min_words} — model likely altered content")
+                    text, applied, planned = _apply_reformat_plan(transcript, out)
+                    if planned and applied >= max(1, planned // 2):
+                        return text
+                    last_err = f"only {applied}/{planned} anchors resolved in the transcript"
                 else:
                     last_err = f"rc={r.returncode}: {(r.stderr or r.stdout).strip()[:200]}"
             except subprocess.TimeoutExpired:
@@ -1780,7 +1831,9 @@ def cmd_reformat(args):
         index_rows.append({"video_id": vid, "status": "ok", "reformatted": now})
         reformatted += 1
         processed += 1
-        if len(index_rows) >= 50:
+        # flush every 10 (was 50): at ~60 videos/h a 50-block left the index
+        # apparently frozen for an hour; smaller blocks make progress visible
+        if len(index_rows) >= 10:
             append_reformat_index_rows(index_rows)
             index_rows = []
         if args.limit and processed >= args.limit:
