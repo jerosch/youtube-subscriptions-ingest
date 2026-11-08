@@ -128,7 +128,8 @@ All HTTP requests go through a session with connect/read timeouts (6s/30s) — a
 
 - **Idempotent and resumable** — outcomes in `raw/_reformat-index.tsv` (`ok` / `no_captions` / `too_long` terminal; errors retried). Transcripts longer than `YT_REFORMAT_MAX_CHARS` (default 120000) are marked `too_long` instead of silently truncated — reformatting must never drop content.
 - **New fetches need no reformat for paragraphs**: `transcript` already breaks paragraphs at real speaking pauses (≥ `YT_PARAGRAPH_GAP_S` seconds, default 1.0) using the caption snippets' own timing — verbatim, no LLM. `reformat` is what brings the existing archive up and adds headings on top.
-- **Tuning** (all optional, in `.env`): `YT_REFORMAT_PI_BIN`, `YT_REFORMAT_PI_MODEL` (both default to the `YT_SUMMARY_*` values), `YT_REFORMAT_MAX_CHARS`, `YT_REFORMAT_TIMEOUT_S`, `YT_REFORMAT_RETRIES`, `YT_REFORMAT_THROTTLE_S`.
+- **Tuning** (all optional, in `.env`): `YT_REFORMAT_PI_BIN`, `YT_REFORMAT_PI_MODEL` (both default to the `YT_SUMMARY_*` values), `YT_REFORMAT_PI_THINKING` (`off`/`minimal`/`low`/`medium`/`high`/`xhigh`/`max`, passed to `pi --thinking`), `YT_REFORMAT_MAX_CHARS`, `YT_REFORMAT_TIMEOUT_S`, `YT_REFORMAT_RETRIES`, `YT_REFORMAT_THROTTLE_S`.
+- **Hybrid fallback** (added 2026-11-07): `YT_REFORMAT_FALLBACK_MODEL` (+ `YT_REFORMAT_FALLBACK_THINKING`) gives every video whose primary-model call fails (timeout or anchor-guard rejection) one retry on a second, more precise model before it counts as an error. Keeps a fast no-thinking model as the workhorse and spends a slow thinking model only on the few percent of transcripts it struggles with.
 
 ### Channel exclusion
 

@@ -1444,6 +1444,7 @@ def summary_config():
     return {
         "pi_bin": os.environ.get("YT_SUMMARY_PI_BIN", "pi"),
         "model": os.environ.get("YT_SUMMARY_PI_MODEL", "").strip(),
+        "thinking": os.environ.get("YT_SUMMARY_PI_THINKING", "").strip(),
         "language": lang,
         "max_chars": int(os.environ.get("YT_SUMMARY_MAX_CHARS", "24000")),
         "timeout_s": float(os.environ.get("YT_SUMMARY_TIMEOUT_S", "300")),
@@ -1498,6 +1499,8 @@ def summarize_one_video(title, channel, transcript, cfg):
         cmd = [cfg["pi_bin"], "-p", "--no-session", "--no-tools", "--system-prompt", system]
         if cfg["model"]:
             cmd += ["--model", cfg["model"]]
+        if cfg.get("thinking"):
+            cmd += ["--thinking", cfg["thinking"]]
         cmd += [f"@{tmp_path}", user]
         last_err = None
         for attempt in range(cfg["retries"] + 1):
@@ -1637,6 +1640,14 @@ def reformat_config():
                                  os.environ.get("YT_SUMMARY_PI_BIN", "pi")),
         "model": os.environ.get("YT_REFORMAT_PI_MODEL",
                                 os.environ.get("YT_SUMMARY_PI_MODEL", "")).strip(),
+        "thinking": os.environ.get("YT_REFORMAT_PI_THINKING", "").strip(),
+        # Second-chance engine (hybrid 2026-11-07): when the primary model's
+        # output is rejected (paraphrased anchors, timeouts), the video is
+        # retried once on a more precise model before it counts as an error.
+        # Keeps the cheap/fast model as workhorse and spends the slow,
+        # thinking-heavy model only on the ~5 % of videos it struggles with.
+        "fallback_model": os.environ.get("YT_REFORMAT_FALLBACK_MODEL", "").strip(),
+        "fallback_thinking": os.environ.get("YT_REFORMAT_FALLBACK_THINKING", "").strip(),
         "max_chars": int(os.environ.get("YT_REFORMAT_MAX_CHARS", "120000")),
         "timeout_s": float(os.environ.get("YT_REFORMAT_TIMEOUT_S", "300")),
         "retries": int(os.environ.get("YT_REFORMAT_RETRIES", "2")),
@@ -1741,6 +1752,8 @@ def reformat_one_video(transcript, cfg):
         cmd = [cfg["pi_bin"], "-p", "--no-session", "--no-tools", "--system-prompt", system]
         if cfg["model"]:
             cmd += ["--model", cfg["model"]]
+        if cfg.get("thinking"):
+            cmd += ["--thinking", cfg["thinking"]]
         cmd += [f"@{tmp_path}", user]
         last_err = None
         for attempt in range(cfg["retries"] + 1):
@@ -1784,6 +1797,11 @@ def write_transcript_into_source_page(path, formatted_text):
 def cmd_reformat(args):
     apply_config()
     cfg = reformat_config()
+    fb_cfg = None
+    if cfg["fallback_model"]:
+        fb_cfg = dict(cfg)
+        fb_cfg["model"] = cfg["fallback_model"]
+        fb_cfg["thinking"] = cfg["fallback_thinking"]
 
     raw_by_id = {r["video_id"]: r["raw_path"] for r in read_raw_index_rows()}
     ingested = []
@@ -1824,9 +1842,19 @@ def cmd_reformat(args):
         try:
             text = reformat_one_video(transcript, cfg)
         except Exception as e:
-            errors += 1
-            print(f"error {vid}: {e}", file=sys.stderr)
-            continue
+            # hybrid: give the fallback model one chance before erroring
+            if fb_cfg:
+                try:
+                    text = reformat_one_video(transcript, fb_cfg)
+                    print(f"fallback {vid}: primary failed ({str(e)[:80]}) — fallback model ok", file=sys.stderr)
+                except Exception as e2:
+                    errors += 1
+                    print(f"error {vid}: primary: {str(e)[:120]} | fallback: {e2}", file=sys.stderr)
+                    continue
+            else:
+                errors += 1
+                print(f"error {vid}: {e}", file=sys.stderr)
+                continue
         write_transcript_into_source_page(src, text)
         index_rows.append({"video_id": vid, "status": "ok", "reformatted": now})
         reformatted += 1
