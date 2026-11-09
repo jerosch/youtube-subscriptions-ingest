@@ -22,6 +22,28 @@ Every video becomes its own note, with a full description, clickable links to an
 
 ---
 
+## Contents
+
+- [What you get](#what-you-get)
+- [Requirements](#requirements)
+- [Install](#install)
+- [Set up your own Google OAuth credentials](#set-up-your-own-google-oauth-credentials)
+- [Configure and authenticate](#configure-and-authenticate)
+- [Where what is configured](#where-what-is-configured)
+- [Use it](#use-it)
+  - [The transcript phase](#the-transcript-phase)
+  - [The summarize phase (optional)](#the-summarize-phase-optional)
+  - [The reformat phase (optional)](#the-reformat-phase-optional)
+  - [Channel exclusion](#channel-exclusion)
+  - [The feed page](#the-feed-page)
+  - [How links work in this vault](#how-links-work-in-this-vault)
+- [Using this with an AI coding assistant (Claude Code, etc.)](#using-this-with-an-ai-coding-assistant-claude-code-etc)
+- [Tuning it to your own subscriptions](#tuning-it-to-your-own-subscriptions)
+- [License](#license)
+- [Credits](#credits)
+
+---
+
 ## What you get
 
 - **`fetch`** — pulls verbatim video metadata (title, description, views, publish date) from every channel you're subscribed to, into a local `raw/` folder. No interpretation, just the facts.
