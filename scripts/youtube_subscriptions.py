@@ -2087,7 +2087,17 @@ def read_thumbnail_index_rows():
 
 
 def thumbnail_done_ids():
-    return {r["video_id"] for r in read_thumbnail_index_rows()}
+    # "ok" only counts when the file is actually on disk: the index is
+    # versioned but the images are gitignored, so a fresh checkout has an
+    # index claiming completion without any files. Missing files are
+    # re-downloaded instead (idempotent, cheap).
+    done = set()
+    for r in read_thumbnail_index_rows():
+        if r["status"] != "ok":
+            done.add(r["video_id"])
+        elif os.path.exists(thumbnail_path(r["video_id"])):
+            done.add(r["video_id"])
+    return done
 
 
 def append_thumbnail_index_rows(rows):
