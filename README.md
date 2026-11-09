@@ -73,6 +73,25 @@ python scripts/youtube_subscriptions.py test
 
 `configure` is safe to run against an existing Obsidian vault — it only creates `index.md`/`log.md` if they don't already exist, and never overwrites real content. Point `--wiki-root` at your actual vault if you have one.
 
+## Where what is configured
+
+Two config files, each with a clear job — plus the output locations they point at:
+
+| File | Written by | Contains |
+|---|---|---|
+| `.env` (repo root, gitignored) | **you** (hand-edited) | Google OAuth client ID/secret, transcript language policy, model choices and thinking levels for `summarize`/`reformat`, timeouts, fallback model. Read on every command start. |
+| `scripts/.youtube_subscriptions_config.json` (gitignored) | the **`configure` command** | `raw_dir` and `wiki_root` (where everything gets written) plus `excluded_channels`. Read by every command via `apply_config()` — and by `tools/gentle_run.py` to locate the vault (override with `YT_VAULT`). |
+| `scripts/.credentials/youtube_token.json` (gitignored, chmod 600) | the **`auth` command** | Access + refresh token for the YouTube Data API. Auto-refreshes; see [docs/google-oauth.md](docs/google-oauth.md) if the refresh token dies. |
+
+Rule of thumb: if a human decides it, it goes in `.env`; if `configure` derives it, it goes in the JSON.
+
+Output locations (both gitignored in the *tool* repo — they are usually their own vault repo):
+
+- **`raw_dir`** — verbatim video metadata (`.md` per video), transcript sidecars, and all phase indexes (`_fetch-index.tsv`, `_transcript-index.tsv`, `_ingest-index.tsv`, `_summary-index.tsv`, `_reformat-index.tsv`, `_thumbnail-index.tsv`)
+- **`wiki_root`** — your vault: `wiki/sources/…` pages, concept/entity pages, `feed.md` + per-month feeds, `thumbnails/`
+
+Documentation map: `README.md` (this file) = setup + command overview · [GUIDE.md](GUIDE.md) = phase-by-phase behavior walkthrough · [docs/google-oauth.md](docs/google-oauth.md) = OAuth setup and token recovery · `SKILL.md` = condensed reference for AI coding assistants.
+
 ## Use it
 
 ```bash
