@@ -1814,31 +1814,36 @@ def cmd_reformat(args):
     done = reformat_done_ids()
 
     reformatted = skipped_nocap = skipped_long = errors = 0
-    index_rows = []
-    processed = 0
-    for vid, src in ingested:
-        if vid in done or not os.path.exists(src):
-            continue
+    workers = max(1, int(os.environ.get("YT_REFORMAT_WORKERS", "1")))
+    import threading
+    from concurrent.futures import ThreadPoolExecutor
+    from collections import Counter
+    index_lock = threading.Lock()
+
+    def flush_row(vid, status):
+        now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        with index_lock:
+            append_reformat_index_rows([{"video_id": vid, "status": status, "reformatted": now}])
+
+    def reformat_one(vid, src):
+        """One video end-to-end; returns status str or None (not processable)."""
         raw_path = raw_by_id.get(vid)
         if not raw_path or not os.path.exists(raw_path):
-            continue
+            return None
         fields = parse_raw_file(raw_path)
         if not fields:
-            continue
+            return None
         transcript = fields.get("transcript")
         if transcript is None:
-            continue  # transcript not fetched yet — not terminal, retried next run
-        now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+            return None  # transcript not fetched yet — not terminal, retried next run
         if transcript.strip() == TRANSCRIPT_UNAVAILABLE.strip():
-            index_rows.append({"video_id": vid, "status": "no_captions", "reformatted": now})
-            skipped_nocap += 1
-            continue
+            flush_row(vid, "no_captions")
+            return "no_captions"
         if len(transcript) > cfg["max_chars"]:
             # terminal: truncating would drop content, and re-fetching with
             # timing paragraphs (fetch_transcript.py) is the fix for these
-            index_rows.append({"video_id": vid, "status": "too_long", "reformatted": now})
-            skipped_long += 1
-            continue
+            flush_row(vid, "too_long")
+            return "too_long"
         try:
             text = reformat_one_video(transcript, cfg)
         except Exception as e:
@@ -1848,28 +1853,29 @@ def cmd_reformat(args):
                     text = reformat_one_video(transcript, fb_cfg)
                     print(f"fallback {vid}: primary failed ({str(e)[:80]}) — fallback model ok", file=sys.stderr)
                 except Exception as e2:
-                    errors += 1
                     print(f"error {vid}: primary: {str(e)[:120]} | fallback: {e2}", file=sys.stderr)
-                    continue
+                    return "error"
             else:
-                errors += 1
                 print(f"error {vid}: {e}", file=sys.stderr)
-                continue
+                return "error"
         write_transcript_into_source_page(src, text)
-        index_rows.append({"video_id": vid, "status": "ok", "reformatted": now})
-        reformatted += 1
-        processed += 1
-        # flush every 10 (was 50): at ~60 videos/h a 50-block left the index
-        # apparently frozen for an hour; smaller blocks make progress visible
-        if len(index_rows) >= 10:
-            append_reformat_index_rows(index_rows)
-            index_rows = []
-        if args.limit and processed >= args.limit:
-            break
-        if cfg["throttle_s"]:
-            time.sleep(cfg["throttle_s"])
-    if index_rows:
-        append_reformat_index_rows(index_rows)
+        flush_row(vid, "ok")
+        return "ok"
+
+    todo = [(vid, src) for vid, src in ingested
+            if vid not in done and os.path.exists(src)]
+    if args.limit:
+        todo = todo[:args.limit]
+    if workers == 1:
+        results = [reformat_one(v, s) for v, s in todo]
+    else:
+        with ThreadPoolExecutor(max_workers=workers) as ex:
+            results = list(ex.map(lambda t: reformat_one(*t), todo))
+    counts = Counter(r for r in results if r)
+    reformatted = counts.get("ok", 0)
+    skipped_nocap = counts.get("no_captions", 0)
+    skipped_long = counts.get("too_long", 0)
+    errors = counts.get("error", 0)
 
     remaining = max(0, len(ingested) - len(reformat_done_ids()))
     print(json.dumps({
