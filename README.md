@@ -56,17 +56,7 @@ pip install -r requirements.txt
 
 **This project ships with zero credentials of any kind.** Every user needs their own — it takes about 5 minutes and costs nothing.
 
-1. Go to [console.cloud.google.com](https://console.cloud.google.com) and create (or select) a project.
-2. **APIs & Services → Library** → search **"YouTube Data API v3"** → **Enable**.
-3. **APIs & Services → Credentials** → **+ Create Credentials** → **OAuth client ID**.
-   - If prompted, configure the OAuth consent screen first (choose "External," fill in the required fields — this is fine for personal use, you don't need to publish/verify the app).
-   - Application type: **Desktop app**. Name it anything.
-   - Click **Create** — a popup shows your **Client ID** and **Client Secret**. Copy both (or find them again anytime under Credentials).
-4. In this project folder:
-   ```bash
-   cp .env.example .env
-   ```
-   Paste your Client ID and Client Secret into `.env`.
+Step-by-step setup (Google Cloud console, `.env`), sign-in, and what to do when the refresh token dies: **[docs/google-oauth.md](docs/google-oauth.md)**.
 
 ## Configure and authenticate
 
