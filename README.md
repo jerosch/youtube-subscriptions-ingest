@@ -1,7 +1,7 @@
 # YouTube Subscriptions → Second-Brain Ingest
 # By Jeffrey Smith - efficientstreet.com
 
-> **Note: actively maintained fork.** This is [`jerosch/youtube-subscriptions-ingest`](https://github.com/jerosch/youtube-subscriptions-ingest), a fork of the original project by Jeffrey Smith. The fork is where active development happens — fixes and features land here (see the changelog below), not in the upstream repo.
+> **Note: actively maintained fork.** This is [`jerosch/youtube-subscriptions-ingest`](https://github.com/jerosch/youtube-subscriptions-ingest), a fork of the original project by Jeffrey Smith. The fork is maintained solely by me (Roland) — all fixes and new features I need go in here, not in the upstream repo.
 >
 > Fork additions (highlights):
 > - `reformat` — inserts paragraphs + `###` topic headings into transcripts via insertion plans (word-preserving by construction), with `YT_REFORMAT_WORKERS` for parallel runs
