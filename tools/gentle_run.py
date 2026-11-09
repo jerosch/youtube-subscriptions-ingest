@@ -11,8 +11,24 @@ from concurrent.futures import ThreadPoolExecutor
 from urllib.parse import urlparse
 
 SKILL = str(Path(__file__).resolve().parent.parent)
-VAULT = "/home/schneiderr/Documents/youtube-subscription-metadata"
 SKILL_SCRIPTS = os.path.join(SKILL, "scripts")
+
+def _resolve_vault():
+    # Vault path comes from the ingest tool's own config (configure command);
+    # YT_VAULT env var overrides. No hardcoded machine paths.
+    if os.environ.get("YT_VAULT"):
+        return os.environ["YT_VAULT"]
+    cfg = os.path.join(SKILL_SCRIPTS, ".youtube_subscriptions_config.json")
+    try:
+        with open(cfg, encoding="utf-8") as f:
+            return json.load(f)["wiki_root"]
+    except Exception:
+        raise SystemExit(
+            "gentle_run: cannot resolve vault — run "
+            "`youtube_subscriptions.py configure --wiki-root ...` or set YT_VAULT"
+        )
+
+VAULT = _resolve_vault()
 PROXY_LIST_FILE = os.environ.get("PROXY_LIST_FILE", os.path.join(VAULT, "tools", "proxies.txt"))
 # Single-instance guard (added 2026-11-03: three runners ran in parallel after
 # pattern-based kills silently missed their target — parallel runners double
