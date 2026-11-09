@@ -1,6 +1,17 @@
 # YouTube Subscriptions → Second-Brain Ingest
 # By Jeffrey Smith - efficientstreet.com
 
+> **Note: actively maintained fork.** This is [`jerosch/youtube-subscriptions-ingest`](https://github.com/jerosch/youtube-subscriptions-ingest), a fork of the original project by Jeffrey Smith. The fork is where active development happens — fixes and features land here (see the changelog below), not in the upstream repo.
+>
+> Fork additions (highlights):
+> - `reformat` — inserts paragraphs + `###` topic headings into transcripts via insertion plans (word-preserving by construction), with `YT_REFORMAT_WORKERS` for parallel runs
+> - `summarize` thinking levels + hybrid fallback model config for the pi passes
+> - Transcript: request timeouts, network-error retries, per-call proxy hooks; native-language track selection via `isTranslatable` + language policy config
+> - `thumbnails` re-download when the index says `ok` but the file is missing (fresh checkout)
+> - CLI: usage help when run without arguments; per-command progress logging to stderr
+> - `tools/gentle_run.py` — proxy-pool runner (rotating free proxies) for when YouTube IP-blocks the host
+> - `requirements.txt` includes `youtube-transcript-api`
+
 Pulls video metadata from your real YouTube subscriptions and turns it into a genuine, cross-linked knowledge graph in your Obsidian-style second brain — not just a flat list of videos.
 
 Every video becomes its own note, with a full description, clickable links to any timestamps mentioned ("2:15 — the pricing breakdown" jumps straight to that moment), and real `[[wikilinks]]` to the topics and named tools/products it touches. Ask about a topic later and it opens instantly, showing you every video that's ever mentioned it — no re-searching, no re-watching.
@@ -36,7 +47,7 @@ Every video becomes its own note, with a full description, clickable links to an
 ## Install
 
 ```bash
-git clone https://github.com/SomewhereSimulated/youtube-subscriptions-ingest.git
+git clone https://github.com/jerosch/youtube-subscriptions-ingest.git
 cd youtube-subscriptions-ingest
 pip install -r requirements.txt
 ```
