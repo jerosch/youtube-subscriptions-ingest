@@ -742,6 +742,7 @@ def cmd_fetch(args):
 
     all_video_ids = []
     per_channel_new_ids = {}
+    _log(f"fetch: {len(subs)} Kanäle werden geprüft (Cutoff {cutoff})")
     for sub in subs:
         uploads_id = uploads_playlists.get(sub["channel_id"])
         if not uploads_id:
@@ -960,8 +961,10 @@ def cmd_transcript(args):
     index_rows = []
     fetched_at = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
-    for raw_path, fields in pending:
+    for i, (raw_path, fields) in enumerate(pending, 1):
         video_id = fields["video_id"]
+        if i % 20 == 1 or i == len(pending):
+            _log(f"transcript: {i}/{len(pending)} — letzte: {video_id}")
         result = fetch_one_transcript(video_id)
         status = result["status"]
 
@@ -1564,6 +1567,7 @@ def cmd_summarize(args):
     summarized = skipped_nocap = errors = 0
     index_rows = []
     processed = 0
+    _log(f"summarize: {len(ingested)} Seiten geprüft, {len(done)} bereits fertig")
     for vid, src in ingested:
         if vid in done or not os.path.exists(src):
             continue
@@ -1866,11 +1870,20 @@ def cmd_reformat(args):
             if vid not in done and os.path.exists(src)]
     if args.limit:
         todo = todo[:args.limit]
+    _log(f"reformat: {len(todo)} Videos offen, {workers} Worker")
+    done_count = [0]
+    def reformat_one_logged(vid, src):
+        r = reformat_one(vid, src)
+        if r in ("ok", "error"):
+            done_count[0] += 1
+            if done_count[0] % 10 == 0:
+                _log(f"reformat: {done_count[0]}/{len(todo)} verarbeitet ({vid}: {r})")
+        return r
     if workers == 1:
-        results = [reformat_one(v, s) for v, s in todo]
+        results = [reformat_one_logged(v, s) for v, s in todo]
     else:
         with ThreadPoolExecutor(max_workers=workers) as ex:
-            results = list(ex.map(lambda t: reformat_one(*t), todo))
+            results = list(ex.map(lambda t: reformat_one_logged(*t), todo))
     counts = Counter(r for r in results if r)
     reformatted = counts.get("ok", 0)
     skipped_nocap = counts.get("no_captions", 0)
@@ -2195,6 +2208,7 @@ def cmd_thumbnails(args):
 
     downloaded = missing = errors = processed = 0
     index_rows = []
+    _log(f"thumbnails: {len([v for v, _ in ingested if v not in done])} fehlen noch")
     for vid, src in ingested:
         if vid in done:
             continue
@@ -2254,7 +2268,9 @@ def cmd_ingest(args):
     ingest_rows = []
     ingested_at = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
-    for raw_path, fields in pending:
+    for idx, (raw_path, fields) in enumerate(pending, 1):
+        if idx % 50 == 1 or idx == len(pending):
+            _log(f"ingest: {idx}/{len(pending)} — letzte: {fields['video_id']}")
         links = generate_links(fields["title"], fields["description"], fields.get("transcript"))
         source_path = write_source_page(fields, links)
         source_name = page_name(source_path)
@@ -2298,9 +2314,14 @@ def cmd_ingest(args):
     }))
 
 
+def _log(msg):
+    """Fortschritts-Zeile (stderr; stdout bleibt reines JSON-Ergebnis)."""
+    print(f"[{datetime.now().strftime('%H:%M:%S')}] {msg}", file=sys.stderr, flush=True)
+
+
 def main():
     parser = argparse.ArgumentParser(description="YouTube subscriptions puller + Brain Matter ingest")
-    sub = parser.add_subparsers(dest="command", required=True)
+    sub = parser.add_subparsers(dest="command")
 
     p_configure = sub.add_parser("configure", help="One-time setup: where raw/ and wiki/ output should go")
     p_configure.add_argument("--raw-dir", required=True, help="Folder for verbatim raw video files")
@@ -2353,6 +2374,15 @@ def main():
                               help="Only fetch the first N thumbnails still missing (for testing before a full run)")
 
     args = parser.parse_args()
+    if not args.command:
+        parser.print_help()
+        print("\nBefehle im Ueberblick:")
+        for name in ("configure", "auth", "test", "fetch", "refresh", "transcript",
+                     "ingest", "summarize", "reformat", "feed", "thumbnails"):
+            print(f"  {name}")
+        print("\nDetails je Befehl: python youtube_subscriptions.py <befehl> --help")
+        raise SystemExit(0)
+    _log(f"befehl={args.command}")
     {
         "configure": cmd_configure, "auth": cmd_auth, "test": cmd_test,
         "fetch": cmd_fetch, "refresh": cmd_refresh, "transcript": cmd_transcript,
