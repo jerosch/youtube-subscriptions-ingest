@@ -533,16 +533,30 @@ def fetch_recent_video_ids(service, uploads_playlist_id, cutoff, max_results=Non
     return video_ids
 
 
-def get_video_details(service, video_ids):
-    """Batch-fetch full snippet + stats. 1 quota unit per call of up to 50 IDs."""
+def get_video_details(service, video_ids, with_content_details=False):
+    """Batch-fetch full snippet + stats. 1 quota unit per call of up to 50 IDs.
+    `with_content_details` additionally returns duration/dimension — same
+    quota cost; used for Shorts detection (Shorts report duration "PT0S")."""
+    part = "snippet,statistics,contentDetails" if with_content_details else "snippet,statistics"
     details = []
     for i in range(0, len(video_ids), 50):
         chunk = video_ids[i:i + 50]
         resp = service.videos().list(
-            part="snippet,statistics", id=",".join(chunk), maxResults=50
+            part=part, id=",".join(chunk), maxResults=50
         ).execute()
         details.extend(resp.get("items", []))
     return details
+
+
+def is_short(video):
+    """Shorts report contentDetails.duration == "PT0S" via the Data API
+    (regular videos carry their real ISO-8601 duration). Falls back to a
+    title hashtag check when contentDetails is absent."""
+    dur = video.get("contentDetails", {}).get("duration")
+    if dur is not None:
+        return dur == "PT0S"
+    title = video.get("snippet", {}).get("title", "").lower()
+    return "#shorts" in title
 
 
 def format_views(count_str):
@@ -761,13 +775,15 @@ def cmd_fetch(args):
         }, ensure_ascii=False))
         return
 
-    details_by_id = {v["id"]: v for v in get_video_details(service, all_video_ids)}
+    details_by_id = {v["id"]: v for v in get_video_details(
+        service, all_video_ids, with_content_details=args.no_shorts)}
 
     known_ids = existing_video_ids()
     fetch_date = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
     channels_touched = set()
     added_count = 0
+    shorts_skipped = 0
     new_index_rows = []
     for sub in subs:
         ids = per_channel_new_ids.get(sub["channel_id"], [])
@@ -776,6 +792,9 @@ def cmd_fetch(args):
                 continue
             video = details_by_id.get(vid)
             if not video:
+                continue
+            if args.no_shorts and is_short(video):
+                shorts_skipped += 1
                 continue
             raw_path = write_raw_file(video, fetch_date)
             new_index_rows.append({
@@ -795,11 +814,75 @@ def cmd_fetch(args):
         "first_run": first_run,
         "fetch_window_start": cutoff,
         "added": added_count,
+        "shorts_skipped": shorts_skipped if args.no_shorts else None,
         "channels_touched": len(channels_touched),
         "total_channels_checked": len(subs),
         "excluded_channels": [s["channel_title"] for s in excluded_subs],
         "raw_dir": RAW_DIR,
         "note": "Written to raw/ only — run `ingest` to bring new videos into the wiki." if added_count else None,
+    }, ensure_ascii=False))
+
+
+def cmd_add(args):
+    """Add arbitrary videos by URL (or bare video ID), no subscription
+    needed. Accepts watch?v=, youtu.be/, shorts/, live/ links and plain
+    11-char IDs. Writes into raw/ + fetch index exactly like `fetch`, so
+    transcript/ingest/summarize/reformat pick them up from there."""
+    apply_config()
+    os.makedirs(RAW_DIR, exist_ok=True)
+
+    def extract_id(s):
+        s = s.strip()
+        if re.fullmatch(r"[A-Za-z0-9_-]{11}", s):
+            return s
+        m = re.search(r"(?:v=|youtu\.be/|shorts/|live/)([A-Za-z0-9_-]{11})", s)
+        return m.group(1) if m else None
+
+    video_ids, bad = [], []
+    for url in args.urls:
+        vid = extract_id(url)
+        if vid:
+            video_ids.append(vid)
+        else:
+            bad.append(url)
+
+    service = get_service()
+    details_by_id = {v["id"]: v for v in get_video_details(service, video_ids)}
+
+    known_ids = existing_video_ids()
+    fetch_date = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    added, skipped_existing, unavailable = [], [], []
+    new_index_rows = []
+    for vid in video_ids:
+        video = details_by_id.get(vid)
+        if not video:
+            unavailable.append(vid)
+            continue
+        if vid in known_ids:
+            skipped_existing.append(vid)
+            continue
+        channel_title = video["snippet"]["channelTitle"]
+        raw_path = write_raw_file(video, fetch_date)
+        new_index_rows.append({
+            "video_id": vid, "channel": channel_title,
+            "published": video["snippet"]["publishedAt"], "fetched": fetch_date,
+            "raw_path": raw_path,
+        })
+        known_ids.add(vid)
+        added.append(vid)
+        _log(f"add: {vid} ({channel_title})")
+
+    if new_index_rows:
+        append_raw_index_rows(new_index_rows)
+
+    print(json.dumps({
+        "success": True,
+        "added": added,
+        "already_in_raw": skipped_existing,
+        "unavailable_or_invalid_id": unavailable,
+        "unparseable_urls": bad,
+        "note": "Written to raw/ only — run `ingest` (and optionally transcript/"
+                "summarize/reformat) to bring them into the wiki." if added else None,
     }, ensure_ascii=False))
 
 
@@ -2346,8 +2429,18 @@ def main():
                           help="Optional cap on videos pulled per channel this run. Omit for "
                                "uncapped (full history within the day window) — this is the "
                                "default; only pass this to deliberately bound a specific run.")
+    p_fetch.add_argument("--no-shorts", action="store_true",
+                          help="Skip Shorts (videos the API reports with duration PT0S) "
+                               "instead of writing them to raw/. Skipped Shorts are not "
+                               "marked done — a later fetch WITHOUT this flag still picks "
+                               "them up while they are inside the fetch window.")
 
     sub.add_parser("refresh", help="Re-fetch metadata for every video already in raw/, in place")
+
+    p_add = sub.add_parser("add", help="Add arbitrary videos by YouTube URL or video ID (no subscription needed)")
+    p_add.add_argument("urls", nargs="+", metavar="URL_OR_ID",
+                       help="One or more watch?v=/youtu.be/shorts/live URLs or bare 11-char "
+                            "video IDs. Writes to raw/ + fetch index like fetch does.")
 
     p_transcript = sub.add_parser("transcript", help="Fetch caption-track transcripts for raw/ videos (sidecar .transcript.txt files)")
     p_transcript.add_argument("--limit", type=int, default=None,
@@ -2377,7 +2470,7 @@ def main():
     if not args.command:
         parser.print_help()
         print("\nBefehle im Ueberblick:")
-        for name in ("configure", "auth", "test", "fetch", "refresh", "transcript",
+        for name in ("configure", "auth", "test", "fetch", "add", "refresh", "transcript",
                      "ingest", "summarize", "reformat", "feed", "thumbnails"):
             print(f"  {name}")
         print("\nDetails je Befehl: python youtube_subscriptions.py <befehl> --help")
@@ -2385,7 +2478,7 @@ def main():
     _log(f"befehl={args.command}")
     {
         "configure": cmd_configure, "auth": cmd_auth, "test": cmd_test,
-        "fetch": cmd_fetch, "refresh": cmd_refresh, "transcript": cmd_transcript,
+        "fetch": cmd_fetch, "add": cmd_add, "refresh": cmd_refresh, "transcript": cmd_transcript,
         "ingest": cmd_ingest, "summarize": cmd_summarize, "reformat": cmd_reformat,
         "feed": cmd_feed,
         "thumbnails": cmd_thumbnails,
