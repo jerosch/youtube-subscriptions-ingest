@@ -704,8 +704,19 @@ def append_raw_index_rows(new_rows):
             ]) + "\n")
 
 
+def _resolve_no_shorts(flag):
+    """Shorts policy -> returns True when Shorts should be SKIPPED.
+    CLI flag wins: --shorts sets args.shorts=True (include), --no-shorts
+    sets False (skip). Without a flag, the global YT_FETCH_NO_SHORTS env
+    var decides (true/1/yes); default is to include Shorts."""
+    if flag is not None:
+        return not flag
+    return os.environ.get("YT_FETCH_NO_SHORTS", "").strip().lower() in ("1", "true", "yes")
+
+
 def cmd_fetch(args):
     apply_config()
+    skip_shorts = _resolve_no_shorts(getattr(args, "shorts", None))
     os.makedirs(RAW_DIR, exist_ok=True)
     service = get_service()
 
@@ -776,7 +787,7 @@ def cmd_fetch(args):
         return
 
     details_by_id = {v["id"]: v for v in get_video_details(
-        service, all_video_ids, with_content_details=args.no_shorts)}
+        service, all_video_ids, with_content_details=skip_shorts)}
 
     known_ids = existing_video_ids()
     fetch_date = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -793,7 +804,7 @@ def cmd_fetch(args):
             video = details_by_id.get(vid)
             if not video:
                 continue
-            if args.no_shorts and is_short(video):
+            if skip_shorts and is_short(video):
                 shorts_skipped += 1
                 continue
             raw_path = write_raw_file(video, fetch_date)
@@ -814,7 +825,7 @@ def cmd_fetch(args):
         "first_run": first_run,
         "fetch_window_start": cutoff,
         "added": added_count,
-        "shorts_skipped": shorts_skipped if args.no_shorts else None,
+        "shorts_skipped": shorts_skipped if skip_shorts else None,
         "channels_touched": len(channels_touched),
         "total_channels_checked": len(subs),
         "excluded_channels": [s["channel_title"] for s in excluded_subs],
@@ -2429,11 +2440,15 @@ def main():
                           help="Optional cap on videos pulled per channel this run. Omit for "
                                "uncapped (full history within the day window) — this is the "
                                "default; only pass this to deliberately bound a specific run.")
-    p_fetch.add_argument("--no-shorts", action="store_true",
+    p_fetch.add_argument("--no-shorts", dest="shorts", action="store_false", default=None,
                           help="Skip Shorts (videos the API reports with duration PT0S) "
-                               "instead of writing them to raw/. Skipped Shorts are not "
-                               "marked done — a later fetch WITHOUT this flag still picks "
-                               "them up while they are inside the fetch window.")
+                               "instead of writing them to raw/. Overrides YT_FETCH_NO_SHORTS. "
+                               "Skipped Shorts are not marked done — a later fetch that "
+                               "includes shorts still picks them up while they are inside "
+                               "the fetch window.")
+    p_fetch.add_argument("--shorts", dest="shorts", action="store_true",
+                          help="Force including Shorts even when YT_FETCH_NO_SHORTS=true "
+                               "is set globally (this is the default when no config is set).")
 
     sub.add_parser("refresh", help="Re-fetch metadata for every video already in raw/, in place")
 

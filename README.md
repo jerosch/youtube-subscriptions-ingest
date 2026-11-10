@@ -120,7 +120,8 @@ Documentation map: `README.md` (this file) = setup + command overview · [GUIDE.
 # Pull new videos from your subscriptions (add --days N to backfill further, e.g. --days 90)
 python scripts/youtube_subscriptions.py fetch
 
-# Skip Shorts (API duration PT0S) while fetching:
+# Skip Shorts (API duration PT0S) while fetching — or set YT_FETCH_NO_SHORTS=true
+# in .env to skip globally; --shorts forces them back in for a single run:
 python scripts/youtube_subscriptions.py fetch --no-shorts
 
 # Add any single video by URL or ID — no subscription needed
