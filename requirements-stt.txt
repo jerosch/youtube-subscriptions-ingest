@@ -1,0 +1,10 @@
+# Optional extras for the `stt` phase (speech-to-text fallback for videos
+# without captions). The STT transcription itself runs against an
+# OpenAI-compatible API (no local ML packages needed) — these are only for
+# the local VAD pre-step (silence trimming before upload).
+#
+# Also required system-side: ffmpeg (apt install ffmpeg) and yt-dlp
+# (pip install yt-dlp, or point YT_STT_YTDLP_BIN at an existing binary).
+sherpa-onnx
+soundfile
+numpy

@@ -148,6 +148,7 @@ INGEST_INDEX_PATH = None
 SUMMARY_INDEX_PATH = None
 REFORMAT_INDEX_PATH = None
 THUMBNAIL_INDEX_PATH = None
+STT_INDEX_PATH = None
 SOURCES_DIR = None
 CONCEPTS_DIR = None
 ENTITIES_DIR = None
@@ -178,7 +179,7 @@ def apply_config():
     """Populates the module-level path globals from the saved config.
     Call this at the top of any command that reads/writes raw/ or wiki/
     (not needed for auth/test/configure)."""
-    global RAW_DIR, RAW_INDEX_PATH, TRANSCRIPT_INDEX_PATH, INGEST_INDEX_PATH, SUMMARY_INDEX_PATH, REFORMAT_INDEX_PATH, THUMBNAIL_INDEX_PATH
+    global RAW_DIR, RAW_INDEX_PATH, TRANSCRIPT_INDEX_PATH, INGEST_INDEX_PATH, SUMMARY_INDEX_PATH, REFORMAT_INDEX_PATH, THUMBNAIL_INDEX_PATH, STT_INDEX_PATH
     global SOURCES_DIR, CONCEPTS_DIR, ENTITIES_DIR, INDEX_PATH, LOG_PATH, FEED_PATH, THUMBS_DIR
     global EXCLUDED_CHANNELS
     cfg = load_config()
@@ -197,6 +198,7 @@ def apply_config():
     SUMMARY_INDEX_PATH = os.path.join(raw_dir, "_summary-index.tsv")
     REFORMAT_INDEX_PATH = os.path.join(raw_dir, "_reformat-index.tsv")
     THUMBNAIL_INDEX_PATH = os.path.join(raw_dir, "_thumbnail-index.tsv")
+    STT_INDEX_PATH = os.path.join(raw_dir, "_stt-index.tsv")
     SOURCES_DIR = os.path.join(wiki_root, "wiki", "sources", "youtube-videos")
     CONCEPTS_DIR = os.path.join(wiki_root, "wiki", "concepts")
     ENTITIES_DIR = os.path.join(wiki_root, "wiki", "entities")
@@ -1095,6 +1097,277 @@ def cmd_transcript(args):
         "remaining_untried": max(0, total_raw - total_processed),
         "note": "Errored videos aren't marked done — re-run `transcript` to retry them." if error_count else None,
     }))
+
+
+# ---------------------------------------------------------------------------
+# stt — speech-to-text fallback for videos WITHOUT a caption track. Optional
+# phase between transcript and ingest: videos whose `transcript` run ended
+# terminal-"unavailable" (channel has no captions) get their audio pulled
+# (yt-dlp), optionally VAD-trimmed (sherpa-onnx Silero VAD, removes silence
+# where Whisper hallucinates), split into chunks, and sent to an
+# OpenAI-compatible /audio/transcriptions endpoint (Whisper large-v3-turbo
+# on as-ai02, reached directly or via ai.ascas.de — pure config). The text
+# lands in the SAME sidecar + raw-file Transcript section caption
+# transcripts use, so ingest/summarize/reformat need to know nothing about
+# STT; a provenance note marks it as machine-recognized. Resumable via
+# _stt-index.tsv. Added 2026-11-10.
+# ---------------------------------------------------------------------------
+
+STT_INDEX_HEADER = "video_id\tstatus\tpath\tword_count\ttranscribed\n"
+STT_PROVENANCE_NOTE = ("_Transkript maschinell per Spracherkennung erzeugt "
+                       "(Whisper) — kein Original-Untertitel._")
+# Terminal STT statuses (never retried): ok = text written, empty = audio
+# had no recognizable speech, no_audio = nothing downloadable.
+STT_TERMINAL_STATUSES = {"ok", "empty", "no_audio"}
+
+
+def _stt_api_key():
+    """YT_STT_API_KEY from .env wins; otherwise fall back to the apiKey of
+    the open-webui provider in ~/.pi/agent/models.json (same server, key
+    already provisioned there — no secret duplication needed)."""
+    key = os.environ.get("YT_STT_API_KEY", "").strip()
+    if key:
+        return key
+    try:
+        with open(os.path.expanduser("~/.pi/agent/models.json"), encoding="utf-8") as f:
+            return json.load(f)["providers"]["open-webui"]["apiKey"]
+    except Exception:
+        return ""
+
+
+def stt_config():
+    return {
+        "base_url": os.environ.get("YT_STT_BASE_URL", "").rstrip("/"),
+        "api_key": _stt_api_key(),
+        "model": os.environ.get("YT_STT_MODEL", "Whisper-Large-v3-Turbo"),
+        "language": os.environ.get("YT_STT_LANGUAGE", ""),
+        "timeout_s": float(os.environ.get("YT_STT_TIMEOUT_S", "600")),
+        "chunk_s": int(os.environ.get("YT_STT_CHUNK_S", "600")),
+        "vad": os.environ.get("YT_STT_VAD", "true").strip().lower() in ("1", "true", "yes"),
+        "vad_model": os.environ.get("YT_STT_VAD_MODEL", ""),
+    }
+
+
+def read_stt_index_rows():
+    if not os.path.exists(STT_INDEX_PATH):
+        return []
+    rows = []
+    with open(STT_INDEX_PATH, encoding="utf-8") as f:
+        for line in f.readlines()[1:]:
+            parts = line.rstrip("\n").split("\t")
+            if len(parts) >= 5 and parts[0]:
+                rows.append({"video_id": parts[0], "status": parts[1], "path": parts[2],
+                             "word_count": parts[3], "transcribed": parts[4]})
+    return rows
+
+
+def stt_done_ids():
+    return {r["video_id"] for r in read_stt_index_rows()}
+
+
+def append_stt_index_rows(rows):
+    is_new = not os.path.exists(STT_INDEX_PATH)
+    with open(STT_INDEX_PATH, "a", encoding="utf-8") as f:
+        if is_new:
+            f.write(STT_INDEX_HEADER)
+        for r in rows:
+            f.write(f"{r['video_id']}\t{r['status']}\t{r['path']}\t{r['word_count']}\t{r['transcribed']}\n")
+
+
+def find_videos_needing_stt(limit=None):
+    """Videos whose transcript phase ended 'unavailable' (no caption track)
+    and that have no terminal STT result yet. Returns (raw_path, fields)."""
+    done = stt_done_ids()
+    raw_by_id = {r["video_id"]: r["raw_path"] for r in read_raw_index_rows()}
+    pending = []
+    for r in read_transcript_index_rows():
+        if r["status"] != "unavailable" or r["video_id"] in done:
+            continue
+        raw_path = raw_by_id.get(r["video_id"])
+        if not raw_path or not os.path.exists(raw_path):
+            continue
+        fields = parse_raw_file(raw_path)
+        if fields:
+            pending.append((raw_path, fields))
+        if limit and len(pending) >= limit:
+            break
+    return pending
+
+
+def stt_download_audio(video_id, out_dir):
+    """Best audio track -> m4a via yt-dlp. Returns path or None."""
+    out = os.path.join(out_dir, f"{video_id}.m4a")
+    cmd = [cfg_ytdlp_bin(), "-f", "bestaudio/best", "-x", "--audio-format", "m4a",
+           "-o", out, "--no-playlist", "--quiet", "--no-warnings",
+           f"https://www.youtube.com/watch?v={video_id}"]
+    try:
+        subprocess.run(cmd, check=True, capture_output=True, timeout=900)
+    except (subprocess.SubprocessError, OSError):
+        return None
+    return out if os.path.exists(out) else None
+
+
+def cfg_ytdlp_bin():
+    return os.environ.get("YT_STT_YTDLP_BIN", "yt-dlp")
+
+
+def stt_to_wav16k(src):
+    """Decode any audio to 16 kHz mono WAV (Whisper/VAD input format)."""
+    dst = os.path.splitext(src)[0] + ".wav"
+    subprocess.run(["ffmpeg", "-y", "-loglevel", "error", "-i", src,
+                    "-ac", "1", "-ar", "16000", dst],
+                   check=True, capture_output=True, timeout=1800)
+    return dst
+
+
+def stt_vad_trim(wav_path, vad_model_path):
+    """Concatenate detected speech segments (Silero VAD via sherpa-onnx),
+    dropping silence — Whisper hallucinates on quiet passages. Returns a
+    new wav path, or None if VAD unavailable/found no speech. On any VAD
+    library problem the caller falls back to the untrimmed audio."""
+    try:
+        import numpy as np
+        import soundfile as sf
+        import sherpa_onnx
+    except ImportError:
+        return None
+    if not vad_model_path or not os.path.exists(vad_model_path):
+        return None
+    try:
+        audio, sr = sf.read(wav_path, dtype="float32")
+        if audio.ndim > 1:
+            audio = audio.mean(axis=1)
+        cfg = sherpa_onnx.VadModelConfig()
+        cfg.silero_vad.model = vad_model_path
+        cfg.silero_vad.threshold = 0.5
+        cfg.silero_vad.min_silence_duration = 0.5
+        cfg.silero_vad.min_speech_duration = 0.25
+        cfg.silero_vad.max_speech_duration = 30.0
+        cfg.sample_rate = 16000
+        vad = sherpa_onnx.VadModel.create(cfg)
+        window = vad.window_size
+        chunks = []
+        for start in range(0, len(audio) - window, window):
+            frame = audio[start:start + window]
+            if vad.is_speech(frame, sr):
+                chunks.append(frame)
+        if not chunks:
+            return None
+        trimmed = np.concatenate(chunks)
+        if len(trimmed) < sr:  # < 1 s of speech: treat as no speech
+            return None
+        dst = wav_path[:-4] + ".vad.wav"
+        sf.write(dst, trimmed, sr)
+        return dst
+    except Exception:
+        return None
+
+
+def stt_split_chunks(wav_path, chunk_s, out_dir):
+    """Split audio into <=chunk_s second MP3 pieces (one upload per chunk;
+    keeps requests under proxy/server size limits). MP3 because the
+    OpenAI-compatible endpoint rejects WAV uploads."""
+    pattern = os.path.join(out_dir, "chunk_%04d.mp3")
+    subprocess.run(["ffmpeg", "-y", "-loglevel", "error", "-i", wav_path,
+                    "-f", "segment", "-segment_time", str(chunk_s),
+                    "-c:a", "libmp3lame", "-b:a", "48k", pattern],
+                   check=True, capture_output=True, timeout=1800)
+    names = sorted(p for p in os.listdir(out_dir)
+                   if p.startswith("chunk_") and p.endswith(".mp3"))
+    return [os.path.join(out_dir, p) for p in names]
+
+
+def stt_transcribe_chunk(chunk_path, cfg):
+    """One upload to the OpenAI-compatible transcriptions endpoint."""
+    import requests
+    with open(chunk_path, "rb") as f:
+        files = {"file": (os.path.basename(chunk_path), f, "audio/mpeg")}
+        data = {"model": cfg["model"]}
+        if cfg["language"]:
+            data["language"] = cfg["language"]
+        headers = {}
+        if cfg["api_key"]:
+            headers["Authorization"] = f"Bearer {cfg['api_key']}"
+        resp = requests.post(f"{cfg['base_url']}/audio/transcriptions",
+                             headers=headers, files=files, data=data,
+                             timeout=cfg["timeout_s"])
+    resp.raise_for_status()
+    return (resp.json().get("text") or "").strip()
+
+
+def cmd_stt(args):
+    apply_config()
+    cfg = stt_config()
+    if not cfg["base_url"]:
+        err("YT_STT_BASE_URL is not set — configure the OpenAI-compatible "
+            "transcriptions endpoint in .env (e.g. https://ai.ascas.de/api/v1).")
+    pending = find_videos_needing_stt(limit=args.limit)
+    if not pending:
+        print(json.dumps({"success": True, "transcribed": 0,
+                          "note": "Nothing to transcribe — every caption-less video has an STT result."}))
+        return
+
+    import tempfile
+    done_count = empty_count = noaudio_count = error_count = 0
+    index_rows = []
+    for i, (raw_path, fields) in enumerate(pending, 1):
+        vid = fields["video_id"]
+        if i % 5 == 1 or i == len(pending):
+            _log(f"stt: {i}/{len(pending)} — letzte: {vid}")
+        now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        with tempfile.TemporaryDirectory(prefix="ytstt_") as tmp:
+            audio = stt_download_audio(vid, tmp)
+            if not audio:
+                index_rows.append({"video_id": vid, "status": "no_audio",
+                                   "path": "", "word_count": 0, "transcribed": now})
+                noaudio_count += 1
+                continue
+            try:
+                wav = stt_to_wav16k(audio)
+                if cfg["vad"]:
+                    trimmed = stt_vad_trim(wav, cfg["vad_model"])
+                    if trimmed:
+                        wav = trimmed
+                chunks = stt_split_chunks(wav, cfg["chunk_s"], tmp)
+                texts = []
+                for chunk in chunks:
+                    t = stt_transcribe_chunk(chunk, cfg)
+                    if t:
+                        texts.append(t)
+            except Exception as e:
+                error_count += 1
+                print(f"error {vid}: {e}", file=sys.stderr)
+                continue  # not indexed — retried next run
+        text = "\n\n".join(texts).strip()
+        if len(text.split()) < 5:
+            index_rows.append({"video_id": vid, "status": "empty",
+                               "path": "", "word_count": 0, "transcribed": now})
+            empty_count += 1
+            continue
+        sidecar = transcript_sidecar_path(raw_path)
+        with open(sidecar, "w", encoding="utf-8") as f:
+            f.write(text)
+        write_transcript_into_raw_file(raw_path, STT_PROVENANCE_NOTE + "\n\n" + text)
+        index_rows.append({"video_id": vid, "status": "ok", "path": sidecar,
+                           "word_count": len(text.split()), "transcribed": now})
+        done_count += 1
+        if len(index_rows) >= 20:
+            append_stt_index_rows(index_rows)
+            index_rows = []
+
+    if index_rows:
+        append_stt_index_rows(index_rows)
+    print(json.dumps({
+        "success": True,
+        "transcribed": done_count,
+        "empty": empty_count,
+        "no_audio": noaudio_count,
+        "errors_this_run": error_count,
+        "remaining": max(0, len(pending) - done_count - empty_count - noaudio_count - error_count),
+        "model": cfg["model"],
+        "note": "Run `ingest` afterwards to bring STT transcripts into the wiki pages."
+                if done_count else None,
+    }, ensure_ascii=False))
 
 
 # ---------------------------------------------------------------------------
@@ -2461,6 +2734,10 @@ def main():
     p_transcript.add_argument("--limit", type=int, default=None,
                                help="Only attempt the first N videos without a terminal transcript result (for testing before a full run)")
 
+    p_stt = sub.add_parser("stt", help="Speech-to-text fallback for videos without captions (yt-dlp audio -> optional VAD -> OpenAI-compatible /audio/transcriptions endpoint)")
+    p_stt.add_argument("--limit", type=int, default=None,
+                       help="Only transcribe the first N caption-less videos lacking an STT result (for testing before a full run)")
+
     p_ingest = sub.add_parser("ingest", help="Process raw/ into wiki/sources + wiki/concepts + wiki/entities")
     p_ingest.add_argument("--limit", type=int, default=None,
                            help="Only ingest the first N un-ingested raw files (for testing before a full run)")
@@ -2486,7 +2763,7 @@ def main():
         parser.print_help()
         print("\nBefehle im Ueberblick:")
         for name in ("configure", "auth", "test", "fetch", "add", "refresh", "transcript",
-                     "ingest", "summarize", "reformat", "feed", "thumbnails"):
+                     "stt", "ingest", "summarize", "reformat", "feed", "thumbnails"):
             print(f"  {name}")
         print("\nDetails je Befehl: python youtube_subscriptions.py <befehl> --help")
         raise SystemExit(0)
@@ -2494,6 +2771,7 @@ def main():
     {
         "configure": cmd_configure, "auth": cmd_auth, "test": cmd_test,
         "fetch": cmd_fetch, "add": cmd_add, "refresh": cmd_refresh, "transcript": cmd_transcript,
+        "stt": cmd_stt,
         "ingest": cmd_ingest, "summarize": cmd_summarize, "reformat": cmd_reformat,
         "feed": cmd_feed,
         "thumbnails": cmd_thumbnails,

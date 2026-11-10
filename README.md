@@ -130,6 +130,10 @@ python scripts/youtube_subscriptions.py add "https://www.youtube.com/watch?v=dQw
 # Optional middle step: pull each video's caption track (see below)
 python scripts/youtube_subscriptions.py transcript
 
+# Optional: speech-to-text for videos WITHOUT captions (Whisper via an
+# OpenAI-compatible endpoint; writes the same sidecar, marked as STT)
+python scripts/youtube_subscriptions.py stt
+
 # Process what's been pulled into real wiki pages
 python scripts/youtube_subscriptions.py ingest
 
