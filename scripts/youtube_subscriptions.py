@@ -1498,6 +1498,15 @@ def today():
     return datetime.now(timezone.utc).strftime("%Y-%m-%d")
 
 
+def escape_markdown_blockquotes(text):
+    """YouTube caption transcripts contain speaker-change markers ('>>',
+    '>> [music]') at line start — Markdown renders those as blockquotes
+    (doubled in the '>>' case), which mangles the transcript display in
+    Obsidian. Escape any line-leading '>' so it renders literally. Only
+    applied to the wiki page rendering; raw/ and sidecars stay verbatim."""
+    return re.sub(r"(?m)^>", r"\\>", text)
+
+
 def write_source_page(raw_fields, links):
     title = raw_fields["title"]
     channel = raw_fields["channel"]
@@ -1540,7 +1549,7 @@ def write_source_page(raw_fields, links):
         + "## Description\n\n"
         f"{render_description_block(raw_fields['description'], url)}\n\n"
         f"{TRANSCRIPT_HEADING}\n\n"
-        + (raw_fields.get("transcript") or "_Not fetched yet — run `transcript` before `ingest` to include this._") + "\n\n"
+        + escape_markdown_blockquotes(raw_fields.get("transcript") or "_Not fetched yet — run `transcript` before `ingest` to include this._") + "\n\n"
         + "## Concepts\n\n"
         + (concept_links + "\n\n" if concept_links else "_None auto-detected._\n\n")
         + "## Entities\n\n"
@@ -2156,7 +2165,7 @@ def write_transcript_into_source_page(path, formatted_text):
     (idempotent, lambda replacement like write_summary_into_source_page)."""
     with open(path, encoding="utf-8") as f:
         content = f.read()
-    section = f"{TRANSCRIPT_HEADING}\n\n{formatted_text.strip()}\n\n"
+    section = f"{TRANSCRIPT_HEADING}\n\n{escape_markdown_blockquotes(formatted_text.strip())}\n\n"
     if SOURCE_TRANSCRIPT_RE.search(content):
         new_content = SOURCE_TRANSCRIPT_RE.sub(lambda m: section, content, count=1)
     else:
