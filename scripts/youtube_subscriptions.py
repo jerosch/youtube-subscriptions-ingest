@@ -1339,6 +1339,8 @@ def cmd_stt(args):
                 print(f"error {vid}: {e}", file=sys.stderr)
                 continue  # not indexed — retried next run
         text = "\n\n".join(texts).strip()
+        if not os.path.exists(raw_path):
+            continue  # raw file deleted mid-run (e.g. channel removed) — skip
         if len(text.split()) < 5:
             index_rows.append({"video_id": vid, "status": "empty",
                                "path": "", "word_count": 0, "transcribed": now})
