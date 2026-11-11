@@ -2422,6 +2422,62 @@ def regenerate_feed():
     return len(entries)
 
 
+def _rewrite_index_without(path, header, predicate):
+    """Rewrite a TSV index dropping rows where predicate(row_fields) is True.
+    Returns number of dropped rows."""
+    if not os.path.exists(path):
+        return 0
+    kept, dropped = [], 0
+    with open(path, encoding="utf-8") as f:
+        for i, line in enumerate(f):
+            if i == 0:
+                continue
+            parts = line.rstrip("\n").split("\t")
+            if not parts or not parts[0]:
+                continue
+            if predicate(parts):
+                dropped += 1
+            else:
+                kept.append(line)
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(header)
+        f.writelines(kept)
+    return dropped
+
+
+def cmd_stt_apply(args):
+    """Bridge STT results into the downstream phases. Videos that were
+    ingested/summarized/reformatted BEFORE their STT transcript arrived are
+    marked terminal 'no_captions' in those indexes and would never be
+    revisited. For every video with STT status 'ok' this drops:
+      - its ingest-index row   -> `ingest` rewrites the wiki page (with transcript)
+      - no_captions summary row -> `summarize` generates a real summary
+      - no_captions reformat row -> `reformat` structures the transcript
+    Run `ingest`, `summarize`, `reformat` afterwards (yt-daily does this
+    automatically). Idempotent: only touches no_captions rows, never ok ones."""
+    apply_config()
+    stt_ok = {r["video_id"] for r in read_stt_index_rows() if r["status"] == "ok"}
+    if not stt_ok:
+        print(json.dumps({"success": True, "note": "No STT 'ok' entries — nothing to apply."}))
+        return
+    dropped_ingest = _rewrite_index_without(
+        INGEST_INDEX_PATH, INGEST_INDEX_HEADER, lambda p: p[0] in stt_ok)
+    dropped_summary = _rewrite_index_without(
+        SUMMARY_INDEX_PATH, SUMMARY_INDEX_HEADER,
+        lambda p: p[0] in stt_ok and len(p) > 1 and p[1] == "no_captions")
+    dropped_reformat = _rewrite_index_without(
+        REFORMAT_INDEX_PATH, REFORMAT_INDEX_HEADER,
+        lambda p: p[0] in stt_ok and len(p) > 1 and p[1] == "no_captions")
+    print(json.dumps({
+        "success": True,
+        "stt_ok_videos": len(stt_ok),
+        "reingest_queued": dropped_ingest,
+        "summary_requeued": dropped_summary,
+        "reformat_requeued": dropped_reformat,
+        "note": "Run `ingest`, `summarize`, `reformat` to apply.",
+    }))
+
+
 def cmd_feed(args):
     apply_config()
     n = regenerate_feed()
@@ -2752,6 +2808,8 @@ def main():
     p_reformat.add_argument("--limit", type=int, default=None,
                             help="Only reformat the first N videos lacking a reformat result (for testing before a full run)")
 
+    sub.add_parser("stt-apply", help="Requeue STT-transcribed videos in ingest/summary/reformat indexes (run after `stt`, before ingest)")
+
     sub.add_parser("feed", help="Regenerate feed.md (chronological link list of all ingested videos)")
 
     p_thumbnails = sub.add_parser("thumbnails", help="Download YouTube thumbnails for ingested videos into the vault, embed them on source pages and in the feed (resumable)")
@@ -2763,7 +2821,7 @@ def main():
         parser.print_help()
         print("\nBefehle im Ueberblick:")
         for name in ("configure", "auth", "test", "fetch", "add", "refresh", "transcript",
-                     "stt", "ingest", "summarize", "reformat", "feed", "thumbnails"):
+                     "stt", "stt-apply", "ingest", "summarize", "reformat", "feed", "thumbnails"):
             print(f"  {name}")
         print("\nDetails je Befehl: python youtube_subscriptions.py <befehl> --help")
         raise SystemExit(0)
@@ -2771,7 +2829,7 @@ def main():
     {
         "configure": cmd_configure, "auth": cmd_auth, "test": cmd_test,
         "fetch": cmd_fetch, "add": cmd_add, "refresh": cmd_refresh, "transcript": cmd_transcript,
-        "stt": cmd_stt,
+        "stt": cmd_stt, "stt-apply": cmd_stt_apply,
         "ingest": cmd_ingest, "summarize": cmd_summarize, "reformat": cmd_reformat,
         "feed": cmd_feed,
         "thumbnails": cmd_thumbnails,
