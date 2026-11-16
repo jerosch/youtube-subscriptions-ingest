@@ -1194,10 +1194,20 @@ def find_videos_needing_stt(limit=None):
     return pending
 
 
+def stt_yt_cookies():
+    """Optional: Cookie-Datei fuer yt-dlp (Bot-Check-Bypass), via YT_STT_COOKIES
+    oder Default ~/.config/yt-cookies.txt wenn vorhanden."""
+    p = os.environ.get("YT_STT_COOKIES") or os.path.expanduser("~/.config/yt-cookies.txt")
+    return p if os.path.exists(p) else None
+
+
 def stt_download_audio(video_id, out_dir):
     """Best audio track -> m4a via yt-dlp. Returns path or None."""
     out = os.path.join(out_dir, f"{video_id}.m4a")
+    ck = stt_yt_cookies()
     cmd = [cfg_ytdlp_bin(), "-f", "bestaudio/best", "-x", "--audio-format", "m4a",
+           *(["--cookies", ck] if ck else []),
+           *["--remote-components", "ejs:github"],
            "-o", out, "--no-playlist", "--quiet", "--no-warnings",
            f"https://www.youtube.com/watch?v={video_id}"]
     try:
